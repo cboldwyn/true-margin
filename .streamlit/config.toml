@@ -1,0 +1,5 @@
+[server]
+maxUploadSize = 1000  # Size in MB (1GB)
+
+[browser]
+gatherUsageStats = false
