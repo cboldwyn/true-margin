@@ -1,11 +1,18 @@
 """
-True Margin Calculator v1.0.0
+True Margin Calculator v1.1.0
 Calculate true product margins by incorporating vendor promo credits
 
 Merges Blaze POS sales data with Haven Promo Performance vendor credit data
 to show the actual margin after accounting for vendor-paid promotions.
 
 CHANGELOG:
+v1.1.0 (2026-01-14)
+- ENHANCEMENT: Multi-file upload for Sales Detail reports
+- ENHANCEMENT: Auto-processing on file upload (no Load Data button)
+- ENHANCEMENT: Chunked file reading for large CSVs (prevents timeouts)
+- ENHANCEMENT: Progress indicators throughout processing
+- ENHANCEMENT: Session state optimization for faster re-renders
+
 v1.0.0 (2026-01-03)
 - Initial release
 - Fuzzy matching within transactions for credit allocation
@@ -30,12 +37,12 @@ from difflib import SequenceMatcher
 # ============================================================================
 
 st.set_page_config(
-    page_title="True Margin Calculator v1.0.0",
+    page_title="True Margin Calculator v1.1.0",
     page_icon="💰",
     layout="wide"
 )
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # Shop name mapping
 SHOP_NAME_MAPPING = {
@@ -67,452 +74,449 @@ DEFAULT_PRIVATE_LABELS = [
 # UTILITY FUNCTIONS
 # ============================================================================
 
-def fuzzy_match_within_transaction(trans_no, credit_df, sales_df):
-    """
-    Match credit products to sales products within a transaction using
-    process of elimination - each credit product matches to closest available.
-    """
-    credit_trans = credit_df[credit_df['Trans No'] == trans_no]
-    sales_trans = sales_df[sales_df['Trans No'] == trans_no]
-    
-    credit_products = credit_trans['Product'].tolist()
-    sales_products = sales_trans['Product'].unique().tolist()
-    
-    matches = {}
-    used_sales = set()
-    
-    # Sort by length for better matching (longer/more specific first)
-    credit_products_sorted = sorted(credit_products, key=len, reverse=True)
-    
-    for credit_prod in credit_products_sorted:
-        best_match = None
-        best_score = 0
-        
-        for sales_prod in sales_products:
-            if sales_prod in used_sales:
-                continue
-            
-            score = SequenceMatcher(None, credit_prod.lower(), sales_prod.lower()).ratio()
-            
-            if score > best_score:
-                best_score = score
-                best_match = sales_prod
-        
-        if best_match:
-            used_sales.add(best_match)
-            matches[credit_prod] = {'sales_product': best_match, 'score': best_score}
-    
-    return matches
-
-
-def match_to_profile_template(product_name, brand, catalog_df):
-    """Match a product to its Profile Template (SKU Type) from catalog"""
-    if pd.isna(product_name) or pd.isna(brand):
-        return None
-    
-    brand_templates = catalog_df[catalog_df['Brand'] == brand]['Profile Template'].unique()
-    
-    if len(brand_templates) == 0:
-        return None
-    
-    # Try exact match first
-    for template in brand_templates:
-        if str(product_name).lower() == str(template).lower():
-            return template
-    
-    # Try STRAIN/COLOR/FLAVOR placeholder matching
-    product_upper = str(product_name).upper()
-    for template in brand_templates:
-        template_upper = str(template).upper()
-        for placeholder in ['STRAIN', 'COLOR', 'FLAVOR']:
-            if placeholder in template_upper:
-                parts = template_upper.split(placeholder)
-                if len(parts) == 2:
-                    prefix, suffix = parts
-                    if product_upper.startswith(prefix) and product_upper.endswith(suffix):
-                        return template
-    
-    # If single template for brand, use it
-    if len(brand_templates) == 1:
-        return brand_templates[0]
-    
-    return None
-
-
 def format_currency(value):
-    """Format value as currency"""
+    """Format number as currency"""
     if pd.isna(value):
-        return "—"
+        return "$0.00"
     return f"${value:,.2f}"
 
-
-def format_percentage(value):
-    """Format value as percentage"""
+def format_percent(value):
+    """Format number as percentage"""
     if pd.isna(value):
-        return "—"
+        return "0.0%"
     return f"{value:.1f}%"
 
+def clean_price(price_str):
+    """Clean and convert price string to float"""
+    if pd.isna(price_str) or price_str == '':
+        return 0.0
+    try:
+        cleaned = str(price_str).replace('$', '').replace(',', '').strip()
+        return float(cleaned) if cleaned else 0.0
+    except:
+        return 0.0
 
-def calculate_margin_pct(margin, net_sales):
-    """Calculate margin percentage safely"""
-    if net_sales == 0 or pd.isna(net_sales) or pd.isna(margin):
-        return 0
-    return (margin / net_sales) * 100
-
+def similarity_score(a, b):
+    """Calculate fuzzy similarity between two strings"""
+    if pd.isna(a) or pd.isna(b):
+        return 0.0
+    return SequenceMatcher(None, str(a).lower(), str(b).lower()).ratio()
 
 # ============================================================================
-# DATA PROCESSING
+# FILE LOADING FUNCTIONS (OPTIMIZED FOR LARGE FILES)
 # ============================================================================
 
-@st.cache_data
-def process_data(sales_df, credit_df, catalog_df, private_labels):
+def load_multiple_sales_files(uploaded_files, progress_callback=None):
     """
-    Process sales and credit data to calculate true margins.
+    Load and combine multiple Total Sales Detail CSV files
     
-    Returns merged DataFrame with all margin calculations.
+    Uses chunked reading for large files to prevent memory issues
+    and provides progress updates via callback
+    
+    Args:
+        uploaded_files: List of uploaded file objects
+        progress_callback: Optional function(progress, status_text) for updates
+        
+    Returns:
+        Combined DataFrame or None if error
     """
-    # Step 1: Fuzzy match credits to sales within transactions
-    all_credit_matches = []
+    if not uploaded_files:
+        return None
     
-    progress_text = st.empty()
-    progress_bar = st.progress(0)
+    all_dfs = []
+    total_files = len(uploaded_files)
     
-    unique_trans = credit_df['Trans No'].unique()
-    
-    for i, trans_no in enumerate(unique_trans):
-        if i % 100 == 0:
-            progress_bar.progress(i / len(unique_trans))
-            progress_text.text(f"Matching credits to sales... {i}/{len(unique_trans)} transactions")
-        
-        matches = fuzzy_match_within_transaction(trans_no, credit_df, sales_df)
-        
-        credit_trans = credit_df[credit_df['Trans No'] == trans_no]
-        
-        for _, row in credit_trans.iterrows():
-            credit_prod = row['Product']
-            match_info = matches.get(credit_prod, {'sales_product': None, 'score': 0})
+    for i, file in enumerate(uploaded_files):
+        try:
+            if progress_callback:
+                progress_callback((i / total_files) * 0.5, f"Loading file {i+1}/{total_files}: {file.name}")
             
-            all_credit_matches.append({
-                'Trans_No': trans_no,
-                'Credit_Product': credit_prod,
-                'Sales_Product': match_info['sales_product'],
-                'Match_Score': match_info['score'],
-                'Vendor_Pays': row['Vendor Pays'],
-                'Haven_Pays': row['Haven Pays'],
-                'Promo_Credit_New': row['Promo Credit New'],
-                'Reporting_Promo': row['Reporting Promo'],
-                'Promo_Type': row['Promo Type']
-            })
+            # Get file size to decide on chunking strategy
+            file.seek(0, 2)  # Seek to end
+            file_size = file.tell()
+            file.seek(0)  # Reset to beginning
+            
+            # For files > 50MB, use chunked reading
+            if file_size > 50 * 1024 * 1024:
+                chunks = []
+                chunk_size = 50000  # rows per chunk
+                
+                for chunk in pd.read_csv(file, chunksize=chunk_size, low_memory=False):
+                    chunks.append(chunk)
+                
+                df = pd.concat(chunks, ignore_index=True)
+            else:
+                df = pd.read_csv(file, low_memory=False)
+            
+            # Add source file identifier
+            df['_Source_File'] = file.name
+            all_dfs.append(df)
+            
+        except Exception as e:
+            st.error(f"Error loading {file.name}: {str(e)}")
+            continue
     
-    progress_bar.progress(1.0)
-    progress_text.text("Credit matching complete!")
+    if not all_dfs:
+        return None
     
-    credit_matched_df = pd.DataFrame(all_credit_matches)
+    if progress_callback:
+        progress_callback(0.6, "Combining files...")
     
-    # Step 2: Aggregate sales by Trans No + Product
-    sales_agg = sales_df.groupby(['Trans No', 'Product']).agg({
-        'Brand': 'first',
-        'Product Category': 'first',
-        'Quantity Sold': 'sum',
-        'Gross Sales': 'sum',
-        'Net Sales': 'sum',
-        'COGS': 'sum',
-        'Product Discounts': 'sum',
-        'Cart Discounts': 'sum',
-        'Unit Cost': 'first',
-        'Product ID': 'first',
-        'Shop': 'first',
-        'Date': 'first'
-    }).reset_index()
+    # Combine all DataFrames
+    combined_df = pd.concat(all_dfs, ignore_index=True)
     
-    # Step 3: Merge with credit data (high/medium confidence only)
-    good_matches = credit_matched_df[credit_matched_df['Match_Score'] >= 0.60]
+    if progress_callback:
+        progress_callback(0.7, "Removing duplicates...")
     
-    merged = pd.merge(
-        sales_agg,
-        good_matches[['Trans_No', 'Sales_Product', 'Vendor_Pays', 'Haven_Pays', 
-                      'Promo_Credit_New', 'Reporting_Promo', 'Promo_Type', 'Match_Score']],
-        left_on=['Trans No', 'Product'],
-        right_on=['Trans_No', 'Sales_Product'],
-        how='left'
+    # Remove exact duplicates (same transaction might appear in overlapping exports)
+    # Use Trans No + Product + Shop as key (EXACT Blaze column names)
+    key_cols = ['Trans No', 'Product', 'Shop']
+    existing_key_cols = [col for col in key_cols if col in combined_df.columns]
+    
+    if existing_key_cols:
+        before_dedup = len(combined_df)
+        combined_df = combined_df.drop_duplicates(subset=existing_key_cols, keep='first')
+        after_dedup = len(combined_df)
+        duplicates_removed = before_dedup - after_dedup
+        
+        if duplicates_removed > 0 and progress_callback:
+            progress_callback(0.75, f"Removed {duplicates_removed:,} duplicate rows")
+    
+    if progress_callback:
+        progress_callback(0.8, "Finalizing...")
+    
+    return combined_df
+
+def load_credit_file(uploaded_file, progress_callback=None):
+    """
+    Load Promo Credit Report CSV
+    
+    Args:
+        uploaded_file: Uploaded file object
+        progress_callback: Optional function(progress, status_text) for updates
+        
+    Returns:
+        DataFrame or None if error
+    """
+    if uploaded_file is None:
+        return None
+    
+    try:
+        if progress_callback:
+            progress_callback(0.85, f"Loading credit report: {uploaded_file.name}")
+        
+        df = pd.read_csv(uploaded_file, low_memory=False)
+        return df
+    except Exception as e:
+        st.error(f"Error loading credit file: {str(e)}")
+        return None
+
+# ============================================================================
+# MATCHING FUNCTIONS
+# ============================================================================
+
+def match_credits_to_sales(sales_df, credit_df, progress_callback=None):
+    """
+    Match credit rows to sales rows using transaction-level fuzzy matching
+    
+    Strategy:
+    1. Group by Trans No
+    2. Within each transaction, match credit products to sales products
+    3. Use process of elimination - each credit product matches to closest available
+    
+    Args:
+        sales_df: Sales DataFrame with Trans No, Product, etc. (Blaze export)
+        credit_df: Credit DataFrame with Trans No, Product, Vendor Pays, etc.
+        progress_callback: Optional function(progress, status_text) for updates
+        
+    Returns:
+        Sales DataFrame with credit columns merged
+    """
+    if progress_callback:
+        progress_callback(0.0, "Preparing credit matching...")
+    
+    # Initialize credit columns in sales
+    sales_df = sales_df.copy()
+    sales_df['Vendor_Pays'] = 0.0
+    sales_df['Haven_Pays'] = 0.0
+    sales_df['Credit_Match_Score'] = 0.0
+    sales_df['Credit_Product_Matched'] = None
+    
+    # Standardize transaction column names
+    # Blaze Total Sales Detail uses 'Trans No'
+    # Credit report uses 'Trans No' (matching)
+    trans_col_sales = 'Trans No' if 'Trans No' in sales_df.columns else None
+    trans_col_credit = 'Trans No' if 'Trans No' in credit_df.columns else ('Transaction ID' if 'Transaction ID' in credit_df.columns else None)
+    
+    if not trans_col_sales or not trans_col_credit:
+        st.warning("Could not find transaction columns for matching")
+        return sales_df
+    
+    # Get unique transactions from credits
+    credit_transactions = credit_df[trans_col_credit].dropna().unique()
+    total_trans = len(credit_transactions)
+    
+    if progress_callback:
+        progress_callback(0.05, f"Matching {total_trans:,} transactions with credits...")
+    
+    # Build credit lookup by transaction
+    credit_by_trans = credit_df.groupby(trans_col_credit)
+    
+    matched_count = 0
+    
+    for i, trans_no in enumerate(credit_transactions):
+        if i % 500 == 0 and progress_callback:
+            progress = 0.05 + (i / total_trans) * 0.9
+            progress_callback(progress, f"Matching transaction {i+1:,}/{total_trans:,}")
+        
+        # Get credits for this transaction
+        trans_credits = credit_by_trans.get_group(trans_no).copy()
+        
+        # Get sales for this transaction
+        sales_mask = sales_df[trans_col_sales] == trans_no
+        if not sales_mask.any():
+            continue
+        
+        trans_sales_indices = sales_df[sales_mask].index.tolist()
+        
+        # Match each credit product to a sales product
+        available_sales_indices = trans_sales_indices.copy()
+        
+        for _, credit_row in trans_credits.iterrows():
+            if not available_sales_indices:
+                break
+            
+            credit_product = str(credit_row.get('Product', ''))
+            vendor_pays = clean_price(credit_row.get('Vendor Pays', 0))
+            haven_pays = clean_price(credit_row.get('Haven Pays', 0))
+            
+            # Find best match among available sales products
+            best_idx = None
+            best_score = 0.0
+            
+            for sales_idx in available_sales_indices:
+                sales_product = str(sales_df.at[sales_idx, 'Product'])
+                score = similarity_score(credit_product, sales_product)
+                
+                if score > best_score:
+                    best_score = score
+                    best_idx = sales_idx
+            
+            # Apply match if good enough (threshold 0.5)
+            if best_idx is not None and best_score >= 0.5:
+                sales_df.at[best_idx, 'Vendor_Pays'] = vendor_pays
+                sales_df.at[best_idx, 'Haven_Pays'] = haven_pays
+                sales_df.at[best_idx, 'Credit_Match_Score'] = best_score
+                sales_df.at[best_idx, 'Credit_Product_Matched'] = credit_product
+                available_sales_indices.remove(best_idx)
+                matched_count += 1
+    
+    if progress_callback:
+        progress_callback(0.95, f"Matched {matched_count:,} credit rows to sales")
+    
+    return sales_df
+
+def add_profile_template_matching(sales_df, catalog_df, progress_callback=None):
+    """
+    Add Profile Template (SKU Type) from Product Catalog
+    
+    Matches on Company Product ID (Product ID)
+    """
+    if catalog_df is None or catalog_df.empty:
+        sales_df['Profile_Template'] = None
+        return sales_df
+    
+    if progress_callback:
+        progress_callback(0.0, "Matching Profile Templates...")
+    
+    # Try to match on Product ID -> Company Product ID
+    if 'Product ID' in sales_df.columns and 'Company Product ID' in catalog_df.columns:
+        # Build lookup
+        template_lookup = {}
+        for _, row in catalog_df.iterrows():
+            prod_id = row.get('Company Product ID')
+            template = row.get('Profile Template')
+            if pd.notna(prod_id) and pd.notna(template):
+                template_lookup[str(prod_id)] = template
+        
+        # Apply lookup
+        sales_df['Profile_Template'] = sales_df['Product ID'].apply(
+            lambda x: template_lookup.get(str(x)) if pd.notna(x) else None
+        )
+        
+        matched = sales_df['Profile_Template'].notna().sum()
+        total = len(sales_df)
+        
+        if progress_callback:
+            progress_callback(1.0, f"Matched {matched:,}/{total:,} products to Profile Templates")
+    else:
+        sales_df['Profile_Template'] = None
+    
+    return sales_df
+
+# ============================================================================
+# MARGIN CALCULATION FUNCTIONS
+# ============================================================================
+
+def calculate_margins(df, private_labels):
+    """
+    Calculate standard and true margins
+    
+    Formulas:
+    - Standard COGS = Unit Cost * Quantity Sold
+    - Standard Margin = Net Sales - Standard COGS
+    - True COGS = Standard COGS - Vendor Pays + Haven Pays
+    - True Margin = Net Sales - True COGS
+    - Margin Lift = Vendor Pays - Haven Pays
+    """
+    df = df.copy()
+    
+    # Clean numeric columns
+    # EXACT column names from Blaze Total Sales Detail export
+    df['Net Sales'] = df['Net Sales'].apply(clean_price)
+    df['Unit Cost'] = df['Unit Cost'].apply(clean_price)
+    df['Quantity Sold'] = pd.to_numeric(df['Quantity Sold'], errors='coerce').fillna(0)
+    
+    # Calculate Standard COGS and Margin
+    df['Standard_COGS'] = df['Unit Cost'] * df['Quantity Sold']
+    df['Standard_Margin'] = df['Net Sales'] - df['Standard_COGS']
+    
+    # Calculate True COGS and Margin
+    df['True_COGS'] = df['Standard_COGS'] - df['Vendor_Pays'] + df['Haven_Pays']
+    df['True_Margin'] = df['Net Sales'] - df['True_COGS']
+    
+    # Margin Lift (impact of promo program)
+    df['Margin_Lift'] = df['Vendor_Pays'] - df['Haven_Pays']
+    
+    # Private Label flag
+    df['Is_Private_Label'] = df['Brand'].isin(private_labels)
+    
+    # Calculate margin percentages
+    df['Standard_Margin_Pct'] = np.where(
+        df['Net Sales'] > 0,
+        (df['Standard_Margin'] / df['Net Sales']) * 100,
+        0
+    )
+    df['True_Margin_Pct'] = np.where(
+        df['Net Sales'] > 0,
+        (df['True_Margin'] / df['Net Sales']) * 100,
+        0
     )
     
-    # Step 4: Add Profile Template (SKU Type) from catalog
-    if catalog_df is not None and len(catalog_df) > 0:
-        progress_text.text("Matching to Profile Templates...")
-        merged['Profile_Template'] = merged.apply(
-            lambda row: match_to_profile_template(row['Product'], row['Brand'], catalog_df), axis=1
+    return df
+
+# ============================================================================
+# PROCESSING PIPELINE
+# ============================================================================
+
+def process_data(sales_df, credit_df, catalog_df, private_labels, progress_container):
+    """
+    Main processing pipeline
+    
+    Steps:
+    1. Clean and validate sales data
+    2. Match credits to sales
+    3. Add Profile Template from catalog
+    4. Calculate margins
+    5. Return processed DataFrame
+    """
+    progress_bar = progress_container.progress(0)
+    status_text = progress_container.empty()
+    
+    def update_progress(pct, text):
+        progress_bar.progress(min(pct, 1.0))
+        status_text.text(text)
+    
+    # Step 1: Clean sales data
+    update_progress(0.05, "Validating sales data...")
+    
+    # EXACT column names from Blaze Total Sales Detail export
+    required_cols = ['Trans No', 'Product', 'Net Sales', 'Unit Cost', 'Quantity Sold']
+    missing_cols = [col for col in required_cols if col not in sales_df.columns]
+    
+    if missing_cols:
+        st.error(f"Missing required columns in sales data: {missing_cols}")
+        return None
+    
+    # Step 2: Match credits to sales
+    update_progress(0.1, "Matching credits to sales transactions...")
+    
+    if credit_df is not None and not credit_df.empty:
+        sales_df = match_credits_to_sales(
+            sales_df, credit_df, 
+            lambda p, t: update_progress(0.1 + p * 0.5, t)
         )
     else:
-        merged['Profile_Template'] = None
+        sales_df['Vendor_Pays'] = 0.0
+        sales_df['Haven_Pays'] = 0.0
     
-    # Step 5: Add Private Label flag
-    private_labels_lower = [b.strip().lower() for b in private_labels]
-    merged['Brand_Lower'] = merged['Brand'].str.lower().str.strip()
-    merged['Is_Private_Label'] = merged['Brand_Lower'].isin(private_labels_lower)
+    # Step 3: Add Profile Template
+    update_progress(0.65, "Adding Profile Templates...")
     
-    # Step 6: Calculate True Margin
-    merged['Vendor_Pays'] = merged['Vendor_Pays'].fillna(0)
-    merged['Haven_Pays'] = merged['Haven_Pays'].fillna(0)
+    sales_df = add_profile_template_matching(
+        sales_df, catalog_df,
+        lambda p, t: update_progress(0.65 + p * 0.15, t)
+    )
     
-    merged['True_COGS'] = merged['COGS'] - merged['Vendor_Pays'] + merged['Haven_Pays']
-    merged['Standard_Margin'] = merged['Net Sales'] - merged['COGS']
-    merged['True_Margin'] = merged['Net Sales'] - merged['True_COGS']
-    merged['Margin_Lift'] = merged['Vendor_Pays'] - merged['Haven_Pays']
+    # Step 4: Calculate margins
+    update_progress(0.85, "Calculating margins...")
     
-    progress_text.empty()
-    progress_bar.empty()
+    sales_df = calculate_margins(sales_df, private_labels)
     
-    return merged, credit_matched_df
-
+    # Step 5: Final cleanup
+    update_progress(0.95, "Finalizing...")
+    
+    # Ensure Shop column exists
+    if 'Shop' not in sales_df.columns:
+        sales_df['Shop'] = 'Unknown'
+    
+    update_progress(1.0, "✅ Processing complete!")
+    
+    return sales_df
 
 # ============================================================================
-# DISPLAY FUNCTIONS
+# AGGREGATION VIEWS
 # ============================================================================
 
-def display_network_overview(df):
-    """Display network-level metrics"""
-    st.subheader("📊 Network Overview")
+def render_network_view(df):
+    """Network-level summary"""
+    st.subheader("🌐 Network Performance")
     
-    total_net_sales = df['Net Sales'].sum()
-    total_std_margin = df['Standard_Margin'].sum()
-    total_true_margin = df['True_Margin'].sum()
-    total_margin_lift = df['Margin_Lift'].sum()
-    total_vendor_pays = df['Vendor_Pays'].sum()
-    total_haven_pays = df['Haven_Pays'].sum()
+    # Key metrics
+    total_sales = df['Net Sales'].sum()
+    std_margin = df['Standard_Margin'].sum()
+    true_margin = df['True_Margin'].sum()
+    vendor_pays = df['Vendor_Pays'].sum()
+    haven_pays = df['Haven_Pays'].sum()
+    margin_lift = df['Margin_Lift'].sum()
+    
+    std_margin_pct = (std_margin / total_sales * 100) if total_sales > 0 else 0
+    true_margin_pct = (true_margin / total_sales * 100) if total_sales > 0 else 0
     
     col1, col2, col3, col4 = st.columns(4)
-    
     with col1:
-        st.metric("Net Sales", format_currency(total_net_sales))
+        st.metric("Net Sales", format_currency(total_sales))
     with col2:
-        std_pct = calculate_margin_pct(total_std_margin, total_net_sales)
-        st.metric("Standard Margin", format_currency(total_std_margin), f"{std_pct:.1f}%")
+        st.metric("Standard Margin", format_currency(std_margin), f"{std_margin_pct:.1f}%")
     with col3:
-        true_pct = calculate_margin_pct(total_true_margin, total_net_sales)
-        delta = true_pct - std_pct
-        st.metric("True Margin", format_currency(total_true_margin), f"{true_pct:.1f}% ({delta:+.1f}%)")
+        st.metric("True Margin", format_currency(true_margin), f"{true_margin_pct:.1f}%")
     with col4:
-        st.metric("Margin Lift", format_currency(total_margin_lift), 
-                  help="Vendor Pays - Haven Pays")
+        lift_delta = f"+{format_currency(margin_lift)}" if margin_lift >= 0 else format_currency(margin_lift)
+        st.metric("Margin Lift", lift_delta)
     
-    # Credit breakdown
-    st.write("**Promo Credit Breakdown:**")
-    credit_col1, credit_col2, credit_col3 = st.columns(3)
-    with credit_col1:
-        st.metric("Vendor Pays (Credit)", format_currency(total_vendor_pays),
-                  help="Credits received from vendors - reduces effective COGS")
-    with credit_col2:
-        st.metric("Haven Pays (Cost)", format_currency(total_haven_pays),
-                  help="Discount cost Haven absorbs - increases effective COGS")
-    with credit_col3:
-        net_credit = total_vendor_pays - total_haven_pays
-        st.metric("Net Credit Impact", format_currency(net_credit),
-                  help="Net benefit from promo programs")
-
-
-def display_private_label_comparison(df):
-    """Display Private Label vs 3rd Party comparison"""
-    st.subheader("🏷️ Private Label vs 3rd Party")
+    st.markdown("---")
     
-    summary = df.groupby('Is_Private_Label').agg({
-        'Net Sales': 'sum',
-        'COGS': 'sum',
-        'True_COGS': 'sum',
-        'Standard_Margin': 'sum',
-        'True_Margin': 'sum',
-        'Vendor_Pays': 'sum',
-        'Haven_Pays': 'sum',
-        'Margin_Lift': 'sum'
-    }).reset_index()
-    
-    summary['Label'] = summary['Is_Private_Label'].apply(lambda x: '🏠 Private Label' if x else '📦 3rd Party')
-    summary['Std_Margin_%'] = (summary['Standard_Margin'] / summary['Net Sales'] * 100).round(1)
-    summary['True_Margin_%'] = (summary['True_Margin'] / summary['Net Sales'] * 100).round(1)
-    summary['Margin_Change'] = summary['True_Margin_%'] - summary['Std_Margin_%']
-    
-    col1, col2 = st.columns(2)
-    
-    for i, row in summary.iterrows():
-        col = col1 if row['Is_Private_Label'] else col2
-        
-        with col:
-            st.write(f"### {row['Label']}")
-            st.metric("Net Sales", format_currency(row['Net Sales']))
-            
-            m1, m2 = st.columns(2)
-            with m1:
-                st.metric("Standard Margin", f"{row['Std_Margin_%']:.1f}%")
-            with m2:
-                st.metric("True Margin", f"{row['True_Margin_%']:.1f}%", 
-                          f"{row['Margin_Change']:+.1f}%")
-            
-            c1, c2 = st.columns(2)
-            with c1:
-                st.metric("Vendor Pays", format_currency(row['Vendor_Pays']))
-            with c2:
-                st.metric("Haven Pays", format_currency(row['Haven_Pays']))
-
-
-def display_brand_analysis(df):
-    """Display brand-level analysis"""
-    st.subheader("🏢 Brand Performance")
-    
-    brand_summary = df.groupby('Brand').agg({
-        'Net Sales': 'sum',
-        'COGS': 'sum',
-        'True_COGS': 'sum',
-        'Standard_Margin': 'sum',
-        'True_Margin': 'sum',
-        'Vendor_Pays': 'sum',
-        'Haven_Pays': 'sum',
-        'Margin_Lift': 'sum',
-        'Is_Private_Label': 'first',
-        'Quantity Sold': 'sum'
-    }).reset_index()
-    
-    brand_summary['Std_Margin_%'] = (brand_summary['Standard_Margin'] / brand_summary['Net Sales'] * 100).round(1)
-    brand_summary['True_Margin_%'] = (brand_summary['True_Margin'] / brand_summary['Net Sales'] * 100).round(1)
-    brand_summary['Margin_Change'] = (brand_summary['True_Margin_%'] - brand_summary['Std_Margin_%']).round(1)
-    brand_summary['Type'] = brand_summary['Is_Private_Label'].apply(lambda x: '🏠 Private' if x else '📦 3rd Party')
-    
-    # Sort options
-    sort_col1, sort_col2 = st.columns([1, 3])
-    with sort_col1:
-        sort_by = st.selectbox("Sort by:", 
-                               ['Net Sales', 'True_Margin_%', 'Margin_Lift', 'Margin_Change'],
-                               index=0)
-    
-    brand_summary = brand_summary.sort_values(sort_by, ascending=False)
-    
-    # Display columns
-    display_cols = ['Type', 'Brand', 'Net Sales', 'Std_Margin_%', 'True_Margin_%', 
-                    'Margin_Change', 'Vendor_Pays', 'Haven_Pays', 'Margin_Lift']
-    
-    # Format for display
-    display_df = brand_summary[display_cols].copy()
-    display_df['Net Sales'] = display_df['Net Sales'].apply(lambda x: f"${x:,.0f}")
-    display_df['Vendor_Pays'] = display_df['Vendor_Pays'].apply(lambda x: f"${x:,.0f}")
-    display_df['Haven_Pays'] = display_df['Haven_Pays'].apply(lambda x: f"${x:,.0f}")
-    display_df['Margin_Lift'] = display_df['Margin_Lift'].apply(lambda x: f"${x:+,.0f}")
-    display_df['Std_Margin_%'] = display_df['Std_Margin_%'].apply(lambda x: f"{x:.1f}%")
-    display_df['True_Margin_%'] = display_df['True_Margin_%'].apply(lambda x: f"{x:.1f}%")
-    display_df['Margin_Change'] = display_df['Margin_Change'].apply(lambda x: f"{x:+.1f}%")
-    
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
-    
-    # Export
-    csv_buffer = io.StringIO()
-    brand_summary.to_csv(csv_buffer, index=False)
-    st.download_button("📥 Download Brand Data", csv_buffer.getvalue(), 
-                       "brand_true_margins.csv", "text/csv")
-
-
-def display_category_analysis(df):
-    """Display category-level analysis"""
-    st.subheader("📂 Category Performance")
-    
-    cat_summary = df.groupby('Product Category').agg({
-        'Net Sales': 'sum',
-        'Standard_Margin': 'sum',
-        'True_Margin': 'sum',
-        'Vendor_Pays': 'sum',
-        'Haven_Pays': 'sum',
-        'Margin_Lift': 'sum',
-        'Quantity Sold': 'sum'
-    }).reset_index()
-    
-    cat_summary['Std_Margin_%'] = (cat_summary['Standard_Margin'] / cat_summary['Net Sales'] * 100).round(1)
-    cat_summary['True_Margin_%'] = (cat_summary['True_Margin'] / cat_summary['Net Sales'] * 100).round(1)
-    cat_summary['Margin_Change'] = (cat_summary['True_Margin_%'] - cat_summary['Std_Margin_%']).round(1)
-    
-    cat_summary = cat_summary.sort_values('Net Sales', ascending=False)
-    
-    # Format for display
-    display_df = cat_summary.copy()
-    display_df['Net Sales'] = display_df['Net Sales'].apply(lambda x: f"${x:,.0f}")
-    display_df['Vendor_Pays'] = display_df['Vendor_Pays'].apply(lambda x: f"${x:,.0f}")
-    display_df['Haven_Pays'] = display_df['Haven_Pays'].apply(lambda x: f"${x:,.0f}")
-    display_df['Margin_Lift'] = display_df['Margin_Lift'].apply(lambda x: f"${x:+,.0f}")
-    display_df['Std_Margin_%'] = display_df['Std_Margin_%'].apply(lambda x: f"{x:.1f}%")
-    display_df['True_Margin_%'] = display_df['True_Margin_%'].apply(lambda x: f"{x:.1f}%")
-    display_df['Margin_Change'] = display_df['Margin_Change'].apply(lambda x: f"{x:+.1f}%")
-    
-    display_cols = ['Product Category', 'Net Sales', 'Std_Margin_%', 'True_Margin_%',
-                    'Margin_Change', 'Vendor_Pays', 'Haven_Pays', 'Margin_Lift']
-    
-    st.dataframe(display_df[display_cols], use_container_width=True, hide_index=True)
-    
-    # Export
-    csv_buffer = io.StringIO()
-    cat_summary.to_csv(csv_buffer, index=False)
-    st.download_button("📥 Download Category Data", csv_buffer.getvalue(),
-                       "category_true_margins.csv", "text/csv")
-
-
-def display_sku_type_analysis(df):
-    """Display SKU Type (Profile Template) analysis"""
-    st.subheader("📦 SKU Type Performance (Profile Template)")
-    
-    # Filter to products with Profile Template
-    df_with_template = df[df['Profile_Template'].notna()].copy()
-    
-    if len(df_with_template) == 0:
-        st.warning("No products matched to Profile Templates. Upload a Product Catalog to enable SKU Type analysis.")
-        return
-    
-    sku_summary = df_with_template.groupby(['Profile_Template', 'Brand']).agg({
-        'Net Sales': 'sum',
-        'Standard_Margin': 'sum',
-        'True_Margin': 'sum',
-        'Vendor_Pays': 'sum',
-        'Haven_Pays': 'sum',
-        'Margin_Lift': 'sum',
-        'Quantity Sold': 'sum',
-        'Is_Private_Label': 'first'
-    }).reset_index()
-    
-    sku_summary['Std_Margin_%'] = (sku_summary['Standard_Margin'] / sku_summary['Net Sales'] * 100).round(1)
-    sku_summary['True_Margin_%'] = (sku_summary['True_Margin'] / sku_summary['Net Sales'] * 100).round(1)
-    sku_summary['Margin_Change'] = (sku_summary['True_Margin_%'] - sku_summary['Std_Margin_%']).round(1)
-    sku_summary['Type'] = sku_summary['Is_Private_Label'].apply(lambda x: '🏠' if x else '📦')
-    
-    # Sort and filter options
-    col1, col2 = st.columns([1, 2])
+    col1, col2, col3 = st.columns(3)
     with col1:
-        sort_by = st.selectbox("Sort by:", 
-                               ['Net Sales', 'True_Margin_%', 'Margin_Lift'],
-                               key='sku_sort')
+        st.metric("💚 Vendor Pays", format_currency(vendor_pays), help="Credits received from vendors")
     with col2:
-        min_sales = st.slider("Minimum Net Sales", 0, 5000, 500, step=100)
-    
-    sku_summary = sku_summary[sku_summary['Net Sales'] >= min_sales]
-    sku_summary = sku_summary.sort_values(sort_by, ascending=False)
-    
-    # Format for display
-    display_df = sku_summary.copy()
-    display_df['Net Sales'] = display_df['Net Sales'].apply(lambda x: f"${x:,.0f}")
-    display_df['Margin_Lift'] = display_df['Margin_Lift'].apply(lambda x: f"${x:+,.0f}")
-    display_df['Std_Margin_%'] = display_df['Std_Margin_%'].apply(lambda x: f"{x:.1f}%")
-    display_df['True_Margin_%'] = display_df['True_Margin_%'].apply(lambda x: f"{x:.1f}%")
-    display_df['Margin_Change'] = display_df['Margin_Change'].apply(lambda x: f"{x:+.1f}%")
-    
-    display_cols = ['Type', 'Brand', 'Profile_Template', 'Net Sales', 
-                    'Std_Margin_%', 'True_Margin_%', 'Margin_Change', 'Margin_Lift']
-    
-    st.dataframe(display_df[display_cols].head(50), use_container_width=True, hide_index=True)
-    
-    st.info(f"Showing {min(50, len(display_df))} of {len(sku_summary)} SKU Types with ≥${min_sales} Net Sales")
-    
-    # Export
-    csv_buffer = io.StringIO()
-    sku_summary.to_csv(csv_buffer, index=False)
-    st.download_button("📥 Download SKU Type Data", csv_buffer.getvalue(),
-                       "sku_type_true_margins.csv", "text/csv")
+        st.metric("🔴 Haven Pays", format_currency(haven_pays), help="Discount cost absorbed by Haven")
+    with col3:
+        transactions = df['Trans No'].nunique() if 'Trans No' in df.columns else 0
+        st.metric("📊 Transactions", f"{transactions:,}")
 
-
-def display_shop_analysis(df):
-    """Display shop-level analysis"""
+def render_shop_view(df):
+    """Shop-level breakdown"""
     st.subheader("🏪 Shop Performance")
     
     shop_summary = df.groupby('Shop').agg({
@@ -522,70 +526,174 @@ def display_shop_analysis(df):
         'Vendor_Pays': 'sum',
         'Haven_Pays': 'sum',
         'Margin_Lift': 'sum',
-        'Quantity Sold': 'sum'
+        'Trans No': 'nunique'
     }).reset_index()
     
-    shop_summary['Std_Margin_%'] = (shop_summary['Standard_Margin'] / shop_summary['Net Sales'] * 100).round(1)
-    shop_summary['True_Margin_%'] = (shop_summary['True_Margin'] / shop_summary['Net Sales'] * 100).round(1)
-    shop_summary['Margin_Change'] = (shop_summary['True_Margin_%'] - shop_summary['Std_Margin_%']).round(1)
-    shop_summary['Shop_Short'] = shop_summary['Shop'].str.replace('HAVEN - ', '')
+    shop_summary.columns = ['Shop', 'Net Sales', 'Std Margin', 'True Margin', 
+                            'Vendor Pays', 'Haven Pays', 'Margin Lift', 'Transactions']
+    
+    shop_summary['Std %'] = (shop_summary['Std Margin'] / shop_summary['Net Sales'] * 100).round(1)
+    shop_summary['True %'] = (shop_summary['True Margin'] / shop_summary['Net Sales'] * 100).round(1)
     
     shop_summary = shop_summary.sort_values('Net Sales', ascending=False)
     
     # Format for display
     display_df = shop_summary.copy()
-    display_df['Net Sales'] = display_df['Net Sales'].apply(lambda x: f"${x:,.0f}")
-    display_df['Vendor_Pays'] = display_df['Vendor_Pays'].apply(lambda x: f"${x:,.0f}")
-    display_df['Haven_Pays'] = display_df['Haven_Pays'].apply(lambda x: f"${x:,.0f}")
-    display_df['Margin_Lift'] = display_df['Margin_Lift'].apply(lambda x: f"${x:+,.0f}")
-    display_df['Std_Margin_%'] = display_df['Std_Margin_%'].apply(lambda x: f"{x:.1f}%")
-    display_df['True_Margin_%'] = display_df['True_Margin_%'].apply(lambda x: f"{x:.1f}%")
-    display_df['Margin_Change'] = display_df['Margin_Change'].apply(lambda x: f"{x:+.1f}%")
+    for col in ['Net Sales', 'Std Margin', 'True Margin', 'Vendor Pays', 'Haven Pays', 'Margin Lift']:
+        display_df[col] = display_df[col].apply(format_currency)
     
-    display_cols = ['Shop_Short', 'Net Sales', 'Std_Margin_%', 'True_Margin_%',
-                    'Margin_Change', 'Vendor_Pays', 'Haven_Pays', 'Margin_Lift']
-    
-    st.dataframe(display_df[display_cols], use_container_width=True, hide_index=True)
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
     
     # Export
     csv_buffer = io.StringIO()
     shop_summary.to_csv(csv_buffer, index=False)
-    st.download_button("📥 Download Shop Data", csv_buffer.getvalue(),
+    st.download_button("📥 Download Shop Data", csv_buffer.getvalue(), 
                        "shop_true_margins.csv", "text/csv")
 
-
-def display_product_detail(df):
-    """Display product-level detail"""
-    st.subheader("🔍 Product Detail")
+def render_brand_view(df, show_private_label_only=False):
+    """Brand-level breakdown"""
+    st.subheader("🏷️ Brand Performance")
     
-    # Filters
-    col1, col2, col3 = st.columns(3)
-    
+    # Filter options
+    col1, col2 = st.columns([1, 3])
     with col1:
-        brands = ['All'] + sorted(df['Brand'].dropna().unique().tolist())
-        selected_brand = st.selectbox("Filter by Brand:", brands)
+        pl_filter = st.selectbox(
+            "Filter:",
+            ["All Brands", "Private Label Only", "Non-Private Label"],
+            key="brand_filter"
+        )
     
-    with col2:
-        categories = ['All'] + sorted(df['Product Category'].dropna().unique().tolist())
-        selected_category = st.selectbox("Filter by Category:", categories)
+    filtered = df.copy()
+    if pl_filter == "Private Label Only":
+        filtered = filtered[filtered['Is_Private_Label'] == True]
+    elif pl_filter == "Non-Private Label":
+        filtered = filtered[filtered['Is_Private_Label'] == False]
     
-    with col3:
-        show_promo_only = st.checkbox("Show only products with promo credits", value=False)
+    brand_summary = filtered.groupby(['Brand', 'Is_Private_Label']).agg({
+        'Net Sales': 'sum',
+        'Standard_Margin': 'sum',
+        'True_Margin': 'sum',
+        'Vendor_Pays': 'sum',
+        'Haven_Pays': 'sum',
+        'Margin_Lift': 'sum',
+        'Quantity Sold': 'sum'
+    }).reset_index()
     
-    # Apply filters
-    filtered_df = df.copy()
+    brand_summary['Std %'] = (brand_summary['Standard_Margin'] / brand_summary['Net Sales'] * 100).round(1)
+    brand_summary['True %'] = (brand_summary['True_Margin'] / brand_summary['Net Sales'] * 100).round(1)
+    brand_summary['PL'] = brand_summary['Is_Private_Label'].map({True: '🏠', False: ''})
     
-    if selected_brand != 'All':
-        filtered_df = filtered_df[filtered_df['Brand'] == selected_brand]
+    brand_summary = brand_summary.sort_values('Net Sales', ascending=False)
     
-    if selected_category != 'All':
-        filtered_df = filtered_df[filtered_df['Product Category'] == selected_category]
+    st.info(f"Showing {len(brand_summary):,} brands")
     
-    if show_promo_only:
-        filtered_df = filtered_df[(filtered_df['Vendor_Pays'] > 0) | (filtered_df['Haven_Pays'] > 0)]
+    # Display columns
+    display_cols = ['PL', 'Brand', 'Net Sales', 'Quantity Sold', 'Std %', 'True %', 
+                    'Vendor_Pays', 'Haven_Pays', 'Margin_Lift']
     
-    # Aggregate by Product
-    product_summary = filtered_df.groupby(['Product', 'Brand', 'Product Category']).agg({
+    display_df = brand_summary[display_cols].head(100).copy()
+    for col in ['Net Sales', 'Vendor_Pays', 'Haven_Pays', 'Margin_Lift']:
+        display_df[col] = display_df[col].apply(format_currency)
+    
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+    # Export
+    csv_buffer = io.StringIO()
+    brand_summary.to_csv(csv_buffer, index=False)
+    st.download_button("📥 Download Brand Data", csv_buffer.getvalue(),
+                       "brand_true_margins.csv", "text/csv")
+
+def render_category_view(df):
+    """Category-level breakdown"""
+    st.subheader("📂 Category Performance")
+    
+    cat_col = 'Product Category' if 'Product Category' in df.columns else 'Category'
+    if cat_col not in df.columns:
+        st.warning("No category column found in data")
+        return
+    
+    cat_summary = df.groupby(cat_col).agg({
+        'Net Sales': 'sum',
+        'Standard_Margin': 'sum',
+        'True_Margin': 'sum',
+        'Vendor_Pays': 'sum',
+        'Haven_Pays': 'sum',
+        'Margin_Lift': 'sum',
+        'Quantity Sold': 'sum'
+    }).reset_index()
+    
+    cat_summary['Std %'] = (cat_summary['Standard_Margin'] / cat_summary['Net Sales'] * 100).round(1)
+    cat_summary['True %'] = (cat_summary['True_Margin'] / cat_summary['Net Sales'] * 100).round(1)
+    
+    cat_summary = cat_summary.sort_values('Net Sales', ascending=False)
+    
+    # Format for display
+    display_df = cat_summary.copy()
+    for col in ['Net Sales', 'Standard_Margin', 'True_Margin', 'Vendor_Pays', 'Haven_Pays', 'Margin_Lift']:
+        display_df[col] = display_df[col].apply(format_currency)
+    
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+    # Export
+    csv_buffer = io.StringIO()
+    cat_summary.to_csv(csv_buffer, index=False)
+    st.download_button("📥 Download Category Data", csv_buffer.getvalue(),
+                       "category_true_margins.csv", "text/csv")
+
+def render_sku_type_view(df):
+    """SKU Type (Profile Template) breakdown"""
+    st.subheader("📦 SKU Type Performance")
+    
+    if 'Profile_Template' not in df.columns or df['Profile_Template'].isna().all():
+        st.warning("No Profile Template data available. Upload Product Catalog to enable this view.")
+        return
+    
+    # Exclude unmatched products for cleaner view
+    matched = df[df['Profile_Template'].notna()]
+    
+    if len(matched) == 0:
+        st.warning("No products matched to Profile Templates")
+        return
+    
+    sku_summary = matched.groupby('Profile_Template').agg({
+        'Net Sales': 'sum',
+        'Standard_Margin': 'sum',
+        'True_Margin': 'sum',
+        'Vendor_Pays': 'sum',
+        'Haven_Pays': 'sum',
+        'Margin_Lift': 'sum',
+        'Quantity Sold': 'sum',
+        'Brand': 'first'
+    }).reset_index()
+    
+    sku_summary['Std %'] = (sku_summary['Standard_Margin'] / sku_summary['Net Sales'] * 100).round(1)
+    sku_summary['True %'] = (sku_summary['True_Margin'] / sku_summary['Net Sales'] * 100).round(1)
+    
+    sku_summary = sku_summary.sort_values('Net Sales', ascending=False)
+    
+    st.info(f"Showing {len(sku_summary):,} SKU Types ({len(matched):,}/{len(df):,} products matched)")
+    
+    display_cols = ['Profile_Template', 'Brand', 'Net Sales', 'Quantity Sold', 'Std %', 'True %',
+                    'Vendor_Pays', 'Haven_Pays', 'Margin_Lift']
+    
+    display_df = sku_summary[display_cols].head(100).copy()
+    for col in ['Net Sales', 'Vendor_Pays', 'Haven_Pays', 'Margin_Lift']:
+        display_df[col] = display_df[col].apply(format_currency)
+    
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+    # Export
+    csv_buffer = io.StringIO()
+    sku_summary.to_csv(csv_buffer, index=False)
+    st.download_button("📥 Download SKU Type Data", csv_buffer.getvalue(),
+                       "sku_type_true_margins.csv", "text/csv")
+
+def render_product_view(df):
+    """Product-level detail"""
+    st.subheader("📋 Product Detail")
+    
+    product_summary = df.groupby(['Product', 'Brand', 'Product Category'] if 'Product Category' in df.columns 
+                                  else ['Product', 'Brand']).agg({
         'Net Sales': 'sum',
         'Standard_Margin': 'sum',
         'True_Margin': 'sum',
@@ -596,25 +704,27 @@ def display_product_detail(df):
         'Profile_Template': 'first'
     }).reset_index()
     
-    product_summary['Std_Margin_%'] = (product_summary['Standard_Margin'] / product_summary['Net Sales'] * 100).round(1)
-    product_summary['True_Margin_%'] = (product_summary['True_Margin'] / product_summary['Net Sales'] * 100).round(1)
+    product_summary['Std %'] = (product_summary['Standard_Margin'] / product_summary['Net Sales'] * 100).round(1)
+    product_summary['True %'] = (product_summary['True_Margin'] / product_summary['Net Sales'] * 100).round(1)
     
     product_summary = product_summary.sort_values('Net Sales', ascending=False)
     
-    st.info(f"Showing {len(product_summary):,} products")
+    st.info(f"Showing top 100 of {len(product_summary):,} products")
     
-    # Display
-    display_cols = ['Brand', 'Product', 'Net Sales', 'Quantity Sold', 
-                    'Std_Margin_%', 'True_Margin_%', 'Vendor_Pays', 'Haven_Pays']
+    display_cols = ['Brand', 'Product', 'Net Sales', 'Quantity Sold', 'Std %', 'True %',
+                    'Vendor_Pays', 'Haven_Pays']
     
-    st.dataframe(product_summary[display_cols].head(100), use_container_width=True, hide_index=True)
+    display_df = product_summary[display_cols].head(100).copy()
+    for col in ['Net Sales', 'Vendor_Pays', 'Haven_Pays']:
+        display_df[col] = display_df[col].apply(format_currency)
+    
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
     
     # Export full data
     csv_buffer = io.StringIO()
     product_summary.to_csv(csv_buffer, index=False)
     st.download_button("📥 Download Product Data", csv_buffer.getvalue(),
                        "product_true_margins.csv", "text/csv")
-
 
 # ============================================================================
 # MAIN APPLICATION
@@ -624,16 +734,25 @@ def main():
     st.title(f"💰 True Margin Calculator v{VERSION}")
     st.markdown("Calculate true product margins by incorporating vendor promo credits")
     
-    # Sidebar - Data Upload
+    # =====================
+    # SIDEBAR - Data Upload
+    # =====================
     st.sidebar.header("📁 Data Sources")
     
     st.sidebar.subheader("Required Files")
     
-    sales_file = st.sidebar.file_uploader(
-        "📊 Sales Report (Blaze POS)",
+    # Multi-file upload for Sales Detail
+    sales_files = st.sidebar.file_uploader(
+        "📊 Sales Reports (Blaze POS)",
         type=['csv'],
-        help="Total Sales Products export from Blaze POS"
+        accept_multiple_files=True,
+        help="Upload one or more Total Sales Detail exports from Blaze POS. Files will be combined automatically."
     )
+    
+    if sales_files:
+        st.sidebar.success(f"✅ {len(sales_files)} sales file(s) selected")
+        for f in sales_files:
+            st.sidebar.text(f"  • {f.name}")
     
     credit_file = st.sidebar.file_uploader(
         "💳 Promo Credit Report",
@@ -655,95 +774,173 @@ def main():
         help="CSV with 'Name' column listing private label brands"
     )
     
-    # Shop Filter
-    st.sidebar.subheader("🏪 Shop Filter")
-    
     # Changelog
     with st.sidebar.expander("📋 Version History"):
         st.markdown("""
+        **v1.1.0** (Current - 2026-01-14)
+        - 📁 Multi-file upload for Sales Detail
+        - ⚡ Auto-processing (no Load button)
+        - 🔄 Chunked loading for large files
+        - 📊 Progress indicators throughout
+        
         **v1.0.0** (2026-01-03)
         - 🚀 Initial release
         - 🔗 Fuzzy matching within transactions
-        - 📦 Profile Template (SKU Type) matching
+        - 📦 Profile Template matching
         - 🏠 Private Label identification
         - 📊 Multi-level aggregation views
-        - 🏪 Shop filtering
-        - 📥 Export functionality
         """)
     
     st.sidebar.markdown("---")
     st.sidebar.markdown(f"**Version {VERSION}**")
     
-    # Main content
-    if sales_file is None or credit_file is None:
-        st.info("👆 Upload Sales Report and Promo Credit Report to get started")
+    # =====================
+    # MAIN CONTENT
+    # =====================
+    
+    # Welcome screen when no files uploaded
+    if not sales_files or not credit_file:
+        st.info("👆 Upload Sales Reports and Promo Credit Report to get started")
         
         st.subheader("📚 How It Works")
         
-        st.markdown("""
-        ### True Margin Formula
+        col1, col2 = st.columns(2)
         
-        ```
-        True COGS = Standard COGS - Vendor Pays + Haven Pays
-        True Margin = Net Sales - True COGS
-        Margin Lift = Vendor Pays - Haven Pays
-        ```
+        with col1:
+            st.markdown("""
+            ### True Margin Formula
+            
+            ```
+            True COGS = Standard COGS - Vendor Pays + Haven Pays
+            True Margin = Net Sales - True COGS
+            Margin Lift = Vendor Pays - Haven Pays
+            ```
+            
+            ### Key Concepts
+            
+            **💚 Vendor Pays** - Credit received from vendors that reduces your effective COGS.
+            
+            **🔴 Haven Pays** - Discount cost Haven absorbs that increases your effective COGS.
+            
+            **📈 Margin Lift** - Net impact of promo programs on margins.
+            """)
         
-        ### Key Concepts
+        with col2:
+            st.markdown("""
+            ### v1.1.0 New Features
+            
+            **📁 Multi-File Upload**
+            - Upload multiple monthly exports
+            - Files are combined automatically
+            - Duplicates removed by transaction
+            
+            **⚡ Auto-Processing**
+            - No more Load Data button
+            - Processes immediately on upload
+            - Optimized for large files
+            
+            **🔄 Chunked Loading**
+            - Handles files >100MB
+            - No more timeouts
+            - Progress indicators throughout
+            """)
         
-        **Vendor Pays** 💚 - Credit received from vendors that reduces your effective COGS.
-        When vendors subsidize promotions, this is money back in your pocket.
-        
-        **Haven Pays** 🔴 - Discount cost Haven absorbs that increases your effective COGS.
-        For private label brands or promos without vendor support, Haven covers the discount.
-        
-        **Margin Lift** 📈 - The net impact of promo programs on your margins.
-        Positive = Vendor credits exceed Haven costs. Negative = Haven is absorbing more than receiving.
-        
-        ### Aggregation Levels
-        
-        1. **Network** - Total performance across all shops
-        2. **Shop** - Individual location performance (with multi-select filter)
-        3. **Brand** - Brand-level performance with Private Label flag
-        4. **Category** - Product category performance
-        5. **SKU Type** - Profile Template level (requires Product Catalog)
-        6. **Product** - Individual product detail
-        """)
         return
     
-    # Load data
-    try:
-        sales_df = pd.read_csv(sales_file, low_memory=False)
-        credit_df = pd.read_csv(credit_file)
+    # =====================
+    # AUTO-PROCESS ON UPLOAD
+    # =====================
+    
+    # Create a unique key from uploaded files to detect changes
+    file_key = "_".join(sorted([f.name for f in sales_files])) + "_" + (credit_file.name if credit_file else "")
+    
+    # Check if we need to reprocess
+    needs_processing = (
+        'processed_data' not in st.session_state or
+        st.session_state.get('file_key') != file_key
+    )
+    
+    if needs_processing:
+        st.info("🔄 Processing data...")
         
-        # Load optional files
+        # Create progress container
+        progress_container = st.container()
+        
+        with progress_container:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+        
+        def update_progress(pct, text):
+            progress_bar.progress(min(pct, 1.0))
+            status_text.text(text)
+        
+        # Step 1: Load Sales Files
+        update_progress(0.05, "Loading sales files...")
+        sales_df = load_multiple_sales_files(sales_files, update_progress)
+        
+        if sales_df is None:
+            st.error("❌ Failed to load sales files")
+            return
+        
+        st.success(f"✅ Loaded {len(sales_df):,} sales rows from {len(sales_files)} file(s)")
+        
+        # Step 2: Load Credit File
+        update_progress(0.25, "Loading credit report...")
+        credit_df = load_credit_file(credit_file, update_progress)
+        
+        if credit_df is not None:
+            st.success(f"✅ Loaded {len(credit_df):,} credit rows")
+        
+        # Step 3: Load Optional Files
         catalog_df = None
         if catalog_file is not None:
-            catalog_df = pd.read_csv(catalog_file)
+            update_progress(0.3, "Loading product catalog...")
+            try:
+                catalog_df = pd.read_csv(catalog_file)
+                st.success(f"✅ Loaded {len(catalog_df):,} catalog entries")
+            except Exception as e:
+                st.warning(f"Could not load catalog: {e}")
         
         private_labels = DEFAULT_PRIVATE_LABELS
         if private_label_file is not None:
-            pl_df = pd.read_csv(private_label_file)
-            if 'Name' in pl_df.columns:
-                private_labels = pl_df['Name'].tolist()
+            try:
+                pl_df = pd.read_csv(private_label_file)
+                if 'Name' in pl_df.columns:
+                    private_labels = pl_df['Name'].tolist()
+                    st.success(f"✅ Loaded {len(private_labels)} private label brands")
+            except Exception as e:
+                st.warning(f"Could not load private labels: {e}")
         
-        st.success(f"✅ Loaded: {len(sales_df):,} sales rows, {len(credit_df):,} credit rows")
+        # Step 4: Process Data
+        processed_df = process_data(sales_df, credit_df, catalog_df, private_labels, progress_container)
         
-    except Exception as e:
-        st.error(f"Error loading files: {str(e)}")
-        return
+        if processed_df is None:
+            st.error("❌ Data processing failed")
+            return
+        
+        # Store in session state
+        st.session_state['processed_data'] = processed_df
+        st.session_state['file_key'] = file_key
+        
+        # Clear progress indicators
+        progress_bar.empty()
+        status_text.empty()
+        
+        st.success(f"✅ Processed {len(processed_df):,} products successfully!")
+        
+        # Force rerun to show results
+        st.rerun()
     
-    # Process data
-    if 'processed_data' not in st.session_state or st.sidebar.button("🔄 Reprocess Data"):
-        with st.spinner("Processing data..."):
-            merged_df, credit_matched_df = process_data(sales_df, credit_df, catalog_df, private_labels)
-            st.session_state['processed_data'] = merged_df
-            st.session_state['credit_matched'] = credit_matched_df
+    # =====================
+    # DISPLAY RESULTS
+    # =====================
     
-    merged_df = st.session_state['processed_data']
+    processed_df = st.session_state['processed_data']
     
-    # Shop filter in sidebar
-    available_shops = sorted(merged_df['Shop'].dropna().unique().tolist())
+    # Shop filter
+    st.sidebar.subheader("🏪 Shop Filter")
+    available_shops = sorted(processed_df['Shop'].dropna().unique().tolist())
+    
     selected_shops = st.sidebar.multiselect(
         "Select Shops:",
         options=available_shops,
@@ -752,61 +949,58 @@ def main():
     )
     
     if selected_shops:
-        filtered_df = merged_df[merged_df['Shop'].isin(selected_shops)]
+        filtered_df = processed_df[processed_df['Shop'].isin(selected_shops)]
     else:
-        filtered_df = merged_df
+        filtered_df = processed_df
     
     st.sidebar.info(f"📊 {len(filtered_df):,} products in view")
     
-    # Validation metrics
-    vendor_captured = merged_df['Vendor_Pays'].sum()
-    haven_captured = merged_df['Haven_Pays'].sum()
+    # Reprocess button
+    if st.sidebar.button("🔄 Reprocess Data"):
+        if 'processed_data' in st.session_state:
+            del st.session_state['processed_data']
+        if 'file_key' in st.session_state:
+            del st.session_state['file_key']
+        st.rerun()
     
-    col1, col2, col3 = st.columns(3)
+    # Validation metrics
+    st.subheader("📊 Data Summary")
+    
+    vendor_captured = filtered_df['Vendor_Pays'].sum()
+    haven_captured = filtered_df['Haven_Pays'].sum()
+    
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Products Analyzed", f"{len(filtered_df):,}")
+        st.metric("Products", f"{len(filtered_df):,}")
     with col2:
-        st.metric("Vendor Credits Captured", format_currency(vendor_captured))
+        transactions = filtered_df['Trans No'].nunique() if 'Trans No' in filtered_df.columns else 0
+        st.metric("Transactions", f"{transactions:,}")
     with col3:
-        st.metric("Haven Costs Captured", format_currency(haven_captured))
+        st.metric("Vendor Credits", format_currency(vendor_captured))
+    with col4:
+        st.metric("Haven Costs", format_currency(haven_captured))
     
     # Tabs for different views
-    tab_names = ["📊 Overview", "🏷️ Private Label", "🏢 Brands", 
-                 "📂 Categories", "📦 SKU Types", "🏪 Shops", "🔍 Products"]
+    tab_names = ["📊 Overview", "🏷️ Brands", "🏪 Shops", "📂 Categories", "📦 SKU Types", "📋 Products"]
     tabs = st.tabs(tab_names)
     
-    with tabs[0]:
-        display_network_overview(filtered_df)
+    with tabs[0]:  # Overview
+        render_network_view(filtered_df)
     
-    with tabs[1]:
-        display_private_label_comparison(filtered_df)
+    with tabs[1]:  # Brands
+        render_brand_view(filtered_df)
     
-    with tabs[2]:
-        display_brand_analysis(filtered_df)
+    with tabs[2]:  # Shops
+        render_shop_view(filtered_df)
     
-    with tabs[3]:
-        display_category_analysis(filtered_df)
+    with tabs[3]:  # Categories
+        render_category_view(filtered_df)
     
-    with tabs[4]:
-        display_sku_type_analysis(filtered_df)
+    with tabs[4]:  # SKU Types
+        render_sku_type_view(filtered_df)
     
-    with tabs[5]:
-        display_shop_analysis(filtered_df)
-    
-    with tabs[6]:
-        display_product_detail(filtered_df)
-    
-    # Full data export
-    st.sidebar.subheader("📥 Export")
-    csv_buffer = io.StringIO()
-    filtered_df.to_csv(csv_buffer, index=False)
-    st.sidebar.download_button(
-        "📥 Download Full Dataset",
-        csv_buffer.getvalue(),
-        "true_margin_full_data.csv",
-        "text/csv"
-    )
-
+    with tabs[5]:  # Products
+        render_product_view(filtered_df)
 
 if __name__ == "__main__":
     main()
