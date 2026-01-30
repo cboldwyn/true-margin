@@ -1,15 +1,25 @@
 """
-True Margin Calculator v1.2.0
+True Margin Calculator v1.2.1
 Calculate true product margins by incorporating vendor promo credits
 
 Merges Blaze POS sales data with Haven Promo Performance vendor credit data
 to show the actual margin after accounting for vendor-paid promotions.
 
-MATCHING ENGINE: Adapted from Price Checker v4.3.3
+MATCHING ENGINE: Adapted from Price Checker v4.3.22
 - Uses same Brand + Category + Weight + Keyword matching logic
 - Column mapping: Blaze 'Product' → 'Item', 'Product Category' → 'Category'
+- Category-aware placeholder/wildcard matching (prevents cross-category mismatches)
+- Apparel matching with size stripping
+- Turn Up/Turn Down pattern handling
 
 CHANGELOG:
+v1.2.1 (2026-01-28)
+- UPDATED: Matching engine to Price Checker v4.3.22
+- CRITICAL: Placeholder/wildcard matching now respects categories (v4.3.21)
+- ADDED: Apparel matching with size stripping (v4.3.17)
+- ADDED: Turn Up/Turn Down pattern handling (v4.3.18)
+- CHANGED: Apparel removed from excluded categories (v4.3.16)
+
 v1.2.0 (2026-01-14)
 - RESTORED: Load Data button for consistency with other Haven apps
 - FIXED: Profile Template matching now uses Price Checker matching engine
@@ -42,13 +52,13 @@ from difflib import SequenceMatcher
 # ============================================================================
 
 st.set_page_config(
-    page_title="True Margin Calculator v1.2.0",
+    page_title="True Margin Calculator v1.2.1",
     page_icon="💰",
     layout="wide"
 )
 
-VERSION = "1.2.0"
-MATCHING_ENGINE_VERSION = "Price Checker v4.3.3"
+VERSION = "1.2.1"
+MATCHING_ENGINE_VERSION = "Price Checker v4.3.22"
 
 # Shop name mapping
 SHOP_NAME_MAPPING = {
@@ -263,7 +273,20 @@ def extract_category_keywords(item_text, category):
 # ============================================================================
 
 def match_placeholder_pattern(product_name, template_name):
-    """Check if a product name matches a template with placeholder patterns (COLOR, STRAIN, FLAVOR)"""
+    """
+    Check if a product name matches a template with placeholder patterns (COLOR, STRAIN, FLAVOR)
+    
+    Handles placeholders like:
+    - STRAIN (any strain name)
+    - COLOR (any color)
+    - FLAVOR (any flavor)
+    - SIZE (any size)
+    
+    Special handling for Stiiizy patterns where STRAIN comes BEFORE bag type:
+    - "Stiiizy - Black Bag Black Cherry 3.5g" matches "Stiiizy - STRAIN Black Bag 3.5g"
+    
+    Updated in v4.3.18 for Turn Up/Turn Down pattern handling
+    """
     if pd.isna(product_name) or pd.isna(template_name):
         return False
     
@@ -276,6 +299,47 @@ def match_placeholder_pattern(product_name, template_name):
     product_upper = str(product_name).upper()
     template_upper = str(template_name).upper()
     
+    # SPECIAL HANDLING FOR "Turn Up/Turn Down" PATTERN (v4.3.18)
+    # Handle templates with "/" options where product might match just one variant
+    if "TURN UP/TURN DOWN" in template_upper and "TURN" in product_upper:
+        # Normalize the template to handle either variant
+        if "TURN UP" in product_upper:
+            template_upper = template_upper.replace("TURN UP/TURN DOWN", "TURN UP")
+        elif "TURN DOWN" in product_upper:
+            template_upper = template_upper.replace("TURN UP/TURN DOWN", "TURN DOWN")
+    
+    # SPECIAL HANDLING FOR STIIIZY STRAIN PATTERNS (v4.3.7)
+    # Template: "Stiiizy - STRAIN Black Bag 3.5g" 
+    # Product:  "Stiiizy - Black Bag Black Cherry 3.5g"
+    if 'STIIIZY' in product_upper and 'STIIIZY' in template_upper and 'STRAIN' in template_upper:
+        # Known Stiiizy bag types
+        bag_types = ['BLACK BAG', 'WHITE BAG', 'BLUE BAG', 'GOLD BAG', 'SILVER BAG', 'PURPLE BAG']
+        
+        for bag_type in bag_types:
+            if bag_type in product_upper and bag_type in template_upper:
+                # Template pattern: "STIIIZY - STRAIN [BAG_TYPE] [WEIGHT]"
+                # Product pattern:  "STIIIZY - [BAG_TYPE] [STRAIN_NAME] [WEIGHT]"
+                
+                # Extract the parts after "STIIIZY -"
+                product_after_brand = product_upper.split('STIIIZY -')[-1].strip()
+                template_after_brand = template_upper.split('STIIIZY -')[-1].strip()
+                
+                # Check if template has "STRAIN [BAG_TYPE]"
+                if template_after_brand.startswith('STRAIN ' + bag_type):
+                    # Extract weight from both
+                    weight_pattern = r'(\d+\.?\d*G)'
+                    product_weight = re.search(weight_pattern, product_after_brand)
+                    template_weight = re.search(weight_pattern, template_after_brand)
+                    
+                    if product_weight and template_weight:
+                        # Check if weights match
+                        if product_weight.group(1) == template_weight.group(1):
+                            # Check if product has the bag type
+                            if bag_type in product_after_brand:
+                                # This is a match!
+                                return True
+    
+    # STANDARD PLACEHOLDER MATCHING
     for placeholder in placeholders:
         if placeholder in template_upper:
             parts = template_upper.split(placeholder)
@@ -292,6 +356,102 @@ def match_placeholder_pattern(product_name, template_name):
                     return True
     
     return False
+
+def match_wildcard_template(item_text, template, wildcards=['COLOR', 'STRAIN', 'FLAVOR']):
+    """
+    Match item against template with wildcards (COLOR, STRAIN, FLAVOR)
+    Returns (match_found, extracted_values) tuple
+    
+    Improved in v4.3.18 to handle complex patterns like "Turn Up/Turn Down"
+    """
+    if pd.isna(item_text) or pd.isna(template):
+        return False, {}
+    
+    item_str = str(item_text).strip()
+    template_str = str(template).strip()
+    
+    # Find all wildcard positions in template
+    wildcard_positions = {}
+    for wildcard in wildcards:
+        if wildcard in template_str:
+            wildcard_positions[wildcard] = template_str.find(wildcard)
+    
+    if not wildcard_positions:
+        return False, {}
+    
+    # Create regex pattern from template
+    pattern = re.escape(template_str)
+    
+    # Replace escaped wildcards with capture groups
+    # Updated regex to handle more characters including /, (), &, etc.
+    for wildcard in wildcards:
+        escaped_wildcard = re.escape(wildcard)
+        if escaped_wildcard in pattern:
+            # More permissive capture group that handles special characters
+            pattern = pattern.replace(escaped_wildcard, r'([^,]+?)', 1)
+    
+    # Try to match
+    match = re.match(pattern + r'\s*$', item_str, re.IGNORECASE)
+    
+    if match:
+        # Extract the wildcard values
+        extracted_values = {}
+        wildcard_list = sorted(wildcard_positions.items(), key=lambda x: x[1])
+        for i, (wildcard, _) in enumerate(wildcard_list, 1):
+            if i <= len(match.groups()):
+                extracted_values[wildcard] = match.group(i).strip()
+        return True, extracted_values
+    
+    return False, {}
+
+def match_apparel_products(row, templates):
+    """
+    Advanced matching for apparel products by stripping size suffixes
+    
+    Apparel products in Company Products have sizes in parentheses:
+    - "Haven - California Shirt (XS)" → matches "Haven - California Shirt"
+    - "Haven - Hoodie (Large)" → matches "Haven - Hoodie"
+    
+    Args:
+        row: Product row from company data
+        templates: List of possible catalog templates for this brand
+    
+    Returns:
+        tuple: (matched_template, match_steps) or (None, [])
+    """
+    company_item = row.get('Product', row.get('Item', ''))
+    match_steps = []
+    
+    # Strip size from company item (anything in parentheses at the end)
+    size_pattern = r'\s*\([^)]+\)\s*$'
+    company_item_no_size = re.sub(size_pattern, '', str(company_item)).strip()
+    
+    # Check if we removed a size
+    if company_item_no_size != str(company_item).strip():
+        size_match = re.search(r'\(([^)]+)\)$', str(company_item))
+        if size_match:
+            extracted_size = size_match.group(1)
+            match_steps.append(f"size: {extracted_size}")
+    
+    # Now try to match the size-stripped item against templates
+    matched_template = None
+    for template in templates:
+        # Clean comparison - case insensitive
+        if company_item_no_size.lower() == str(template).lower():
+            matched_template = template
+            match_steps.append("exact match (without size)")
+            break
+    
+    # If no exact match, try partial matching for complex apparel names
+    if not matched_template and len(templates) == 1:
+        # If only one template for this brand/category, more lenient matching
+        template = templates[0]
+        # Check if the core product name is in both
+        if company_item_no_size.lower() in str(template).lower() or str(template).lower() in company_item_no_size.lower():
+            matched_template = template
+            match_steps.append("partial match (single template)")
+    
+    return (matched_template, match_steps) if matched_template else (None, [])
 
 # ============================================================================
 # FILE LOADING FUNCTIONS
