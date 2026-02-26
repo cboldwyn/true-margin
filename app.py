@@ -1,5 +1,5 @@
 """
-True Margin Calculator v1.3.2
+True Margin Calculator v1.4.5
 Calculate true product margins by incorporating vendor promo credits
 
 Merges Blaze POS sales data with Haven Promo Performance vendor credit data
@@ -13,6 +13,51 @@ MATCHING ENGINE: Adapted from Price Checker v4.3.22
 - Turn Up/Turn Down pattern handling
 
 CHANGELOG:
+v1.4.5 (2026-02-25)
+- NEW: Direct PDF report generation (no more HTML → print → PDF)
+- PDF auto-fits to landscape letter, no scaling needed
+- Smart filter description: shows actual brand/category/template names
+- Products count moved to header (top right corner)
+- Table limited to 35 rows to fit on one page, sorted by True % desc
+- Report shows "Showing top X of Y products" if truncated
+
+v1.4.4 (2026-02-25)
+- REDESIGN: Product summary layout prioritizes key metrics
+  Hero row: True Margin (large), Gross Profit (large), Products
+  Detail row: True Unit Cost, Avg Sell Price (NEW), True COGS, Net Sales, Qty Sold, Margin Lift
+- NEW: Average Selling Price = Net Sales ÷ Qty Sold
+- Report redesign: hero cards for margin/profit, table sorted by True % desc
+- Report table columns: True %, Gross Profit, Unit Cost, Sell Price, Qty
+
+v1.4.3 (2026-02-25)
+- NEW: Print Report button generates clean HTML report
+- Report includes: summary metrics + product table
+- Optimized for browser print (Ctrl+P → Save as PDF)
+- Product table shows: Brand, Product, Category, Net Sales, True COGS, Gross Profit, True %, Unit Cost, Qty
+
+v1.4.2 (2026-02-04)
+- ENHANCED: Product Detail summary reorganized into logical groups
+  Row 1: Products, Net Sales, Gross Profit, True Margin %, Vendor Pays, COGS Adj, Margin Lift
+  Row 2: Qty Sold, Catalog Unit Cost (Std COGS/Qty), True Unit Cost (True COGS/Qty)
+- True Unit Cost shows delta vs Catalog Unit Cost (green = savings from credits)
+- Removed Haven Pays from summary (still in data table)
+
+v1.4.1 (2026-02-04)
+- ENHANCED: Product Detail selection summary expanded with True COGS, Gross Profit, Avg Unit Cost
+- Summary split into two rows: Row 1 (Sales/COGS/Margins), Row 2 (Credits/Quantities)
+- True Margin % tooltip shows Std Margin % for quick comparison
+
+v1.4.0 (2026-02-04)
+- NEW: COGS Adjustments — off-system credit memos applied as % reduction on Standard COGS
+  Configurable per brand with category-specific override rates
+  Currently configured: Stiiizy 30% Vape/Accessories, 20% all other categories
+- COGS_Adjustment column added to all aggregation views (Network, Shop, Brand, Category,
+  SKU Type, Product Detail)
+- True COGS formula updated: Standard_COGS - Vendor_Pays - COGS_Adjustment + Haven_Pays
+- Margin Lift formula updated: Vendor_Pays + COGS_Adjustment - Haven_Pays
+- Sidebar shows active COGS Adjustment configuration
+- Data Summary shows COGS Adjustments total alongside Vendor Credits
+
 v1.3.2 (2026-02-04)
 - ENHANCED: Product Detail tab rebuilt with rich filtering controls
   Text search (comma-separated terms), Brand, Category, SKU Type (Template),
@@ -82,19 +127,47 @@ import numpy as np
 import io
 import re
 from difflib import SequenceMatcher
+from datetime import datetime
+
+# PDF generation
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter, landscape
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
 st.set_page_config(
-    page_title="True Margin Calculator v1.3.2",
+    page_title="True Margin Calculator v1.4.5",
     page_icon="💰",
     layout="wide"
 )
 
-VERSION = "1.3.2"
+VERSION = "1.4.5"
 MATCHING_ENGINE_VERSION = "Price Checker v4.3.22"
+
+# COGS Adjustments - Off-system credit memos applied as % reduction on Standard COGS
+# These function like vendor rebates: they reduce True COGS without changing Standard COGS.
+# Structure: brand → { 'default': pct, 'categories': { category: pct } }
+# Category names must match Blaze POS Product Category values exactly.
+COGS_ADJUSTMENTS = {
+    'Stiiizy': {
+        'default': 0.20,        # 20% COGS reduction on all other Stiiizy categories
+        'categories': {
+            'Vape': 0.30,       # 30% COGS reduction on Vape
+            'Accessories': 0.30, # 30% COGS reduction on Accessories
+        }
+    },
+    # Add more brands here as needed:
+    # 'Brand Name': {
+    #     'default': 0.10,
+    #     'categories': { 'Vape': 0.15 }
+    # },
+}
 
 # Shop name mapping
 SHOP_NAME_MAPPING = {
@@ -161,6 +234,238 @@ def similarity_score(a, b):
     if pd.isna(a) or pd.isna(b):
         return 0.0
     return SequenceMatcher(None, str(a).lower(), str(b).lower()).ratio()
+
+def generate_product_report_pdf(filtered_df, summary_metrics, filter_info, title="Product Margin Report"):
+    """
+    Generate a clean, print-ready PDF report for filtered product data.
+    
+    Args:
+        filtered_df: DataFrame with filtered products
+        summary_metrics: dict with margin, profit, unit economics metrics
+        filter_info: dict with filter details (brands, categories, templates, etc.)
+        title: report title
+    
+    Returns:
+        bytes: PDF content
+    """
+    m = summary_metrics
+    
+    # Create PDF buffer
+    buffer = io.BytesIO()
+    
+    # Use landscape letter for more width
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(letter),
+                           leftMargin=0.5*inch, rightMargin=0.5*inch,
+                           topMargin=0.4*inch, bottomMargin=0.4*inch)
+    
+    elements = []
+    styles = getSampleStyleSheet()
+    
+    # Custom styles
+    title_style = ParagraphStyle('Title', parent=styles['Heading1'],
+                                  fontSize=16, textColor=colors.HexColor('#2E7D32'),
+                                  spaceAfter=2)
+    subtitle_style = ParagraphStyle('Subtitle', parent=styles['Normal'],
+                                     fontSize=8, textColor=colors.gray, spaceAfter=8)
+    
+    # Build smart filter description
+    filter_parts = []
+    if filter_info.get('brands'):
+        brands = filter_info['brands']
+        if len(brands) == 1:
+            filter_parts.append(brands[0])
+        elif len(brands) <= 3:
+            filter_parts.append(', '.join(brands))
+        else:
+            filter_parts.append(f"{len(brands)} brands")
+    
+    if filter_info.get('categories'):
+        cats = filter_info['categories']
+        if len(cats) == 1:
+            filter_parts.append(cats[0])
+        elif len(cats) <= 3:
+            filter_parts.append(', '.join(cats))
+    
+    if filter_info.get('templates'):
+        templates = filter_info['templates']
+        if len(templates) == 1:
+            # Show SKU type name without prefix if possible
+            t = templates[0]
+            filter_parts.append(t)
+        elif len(templates) <= 2:
+            filter_parts.append(', '.join(templates))
+        else:
+            filter_parts.append(f"{len(templates)} SKU types")
+    
+    if filter_info.get('search'):
+        filter_parts.append(f'"{filter_info["search"]}"')
+    
+    filter_desc = ' · '.join(filter_parts) if filter_parts else 'All Products'
+    
+    # Header row: Title left, Products count right
+    header_data = [
+        [Paragraph(f"<b>{title}</b>", title_style), 
+         '', '', '',
+         Paragraph(f"<b>{m['products']:,}</b> products", 
+                   ParagraphStyle('Right', parent=styles['Normal'], fontSize=12, alignment=TA_RIGHT))]
+    ]
+    header_table = Table(header_data, colWidths=[4*inch, 1*inch, 1*inch, 1*inch, 2.5*inch])
+    header_table.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ALIGN', (-1, 0), (-1, 0), 'RIGHT'),
+    ]))
+    elements.append(header_table)
+    
+    # Subtitle with date and filter
+    elements.append(Paragraph(
+        f"{datetime.now().strftime('%B %d, %Y')} · Haven Cannabis · <i>{filter_desc}</i>",
+        subtitle_style))
+    elements.append(Spacer(1, 8))
+    
+    # Hero metrics row
+    hero_style = ParagraphStyle('Hero', parent=styles['Normal'], fontSize=24, 
+                                 alignment=TA_CENTER, textColor=colors.white)
+    hero_label_style = ParagraphStyle('HeroLabel', parent=styles['Normal'], fontSize=8, 
+                                       alignment=TA_CENTER, textColor=colors.HexColor('#E8F5E9'))
+    
+    hero_data = [[
+        Paragraph("<b>TRUE MARGIN</b>", hero_label_style),
+        Paragraph("<b>GROSS PROFIT</b>", hero_label_style),
+    ], [
+        Paragraph(f"<b>{m['true_margin_pct']:.1f}%</b>", hero_style),
+        Paragraph(f"<b>{format_currency(m['gross_profit'])}</b>", hero_style),
+    ]]
+    hero_table = Table(hero_data, colWidths=[3.5*inch, 3.5*inch], rowHeights=[0.2*inch, 0.45*inch])
+    hero_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#2E7D32')),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 15),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 15),
+        ('TOPPADDING', (0, 0), (-1, 0), 6),
+        ('BOTTOMPADDING', (0, -1), (-1, -1), 8),
+        ('ROUNDEDCORNERS', [6, 6, 6, 6]),
+    ]))
+    elements.append(hero_table)
+    elements.append(Spacer(1, 8))
+    
+    # Detail metrics row
+    detail_label_style = ParagraphStyle('DetailLabel', parent=styles['Normal'], fontSize=7, 
+                                         alignment=TA_CENTER, textColor=colors.gray)
+    detail_value_style = ParagraphStyle('DetailValue', parent=styles['Normal'], fontSize=11, 
+                                         alignment=TA_CENTER, fontName='Helvetica-Bold')
+    
+    detail_data = [[
+        Paragraph("TRUE UNIT COST", detail_label_style),
+        Paragraph("AVG SELL PRICE", detail_label_style),
+        Paragraph("TRUE COGS", detail_label_style),
+        Paragraph("NET SALES", detail_label_style),
+        Paragraph("QTY SOLD", detail_label_style),
+        Paragraph("MARGIN LIFT", detail_label_style),
+    ], [
+        Paragraph(format_currency(m['true_unit_cost']), detail_value_style),
+        Paragraph(format_currency(m.get('avg_selling_price', 0)), detail_value_style),
+        Paragraph(format_currency(m['true_cogs']), detail_value_style),
+        Paragraph(format_currency(m['net_sales']), detail_value_style),
+        Paragraph(f"{m['qty_sold']:,.0f}", detail_value_style),
+        Paragraph(format_currency(m['margin_lift']), detail_value_style),
+    ]]
+    detail_table = Table(detail_data, colWidths=[1.5*inch]*6, rowHeights=[0.2*inch, 0.3*inch])
+    detail_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#FAFAFA')),
+        ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#E0E0E0')),
+        ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#E0E0E0')),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, 0), 4),
+        ('BOTTOMPADDING', (0, -1), (-1, -1), 4),
+    ]))
+    elements.append(detail_table)
+    elements.append(Spacer(1, 10))
+    
+    # Product table header style
+    th_style = ParagraphStyle('TableHeader', parent=styles['Normal'], fontSize=8, 
+                               textColor=colors.white, fontName='Helvetica-Bold')
+    td_style = ParagraphStyle('TableCell', parent=styles['Normal'], fontSize=8)
+    td_right_style = ParagraphStyle('TableCellRight', parent=styles['Normal'], fontSize=8, alignment=TA_RIGHT)
+    
+    # Build product table
+    table_data = [[
+        Paragraph("Brand", th_style),
+        Paragraph("Product", th_style),
+        Paragraph("Category", th_style),
+        Paragraph("True %", th_style),
+        Paragraph("Gross Profit", th_style),
+        Paragraph("Unit Cost", th_style),
+        Paragraph("Sell Price", th_style),
+        Paragraph("Qty", th_style),
+    ]]
+    
+    # Sort by True % descending and limit rows to fit page
+    sorted_df = filtered_df.sort_values('True %', ascending=False)
+    max_rows = min(len(sorted_df), 35)  # Limit to fit on one page
+    
+    for _, row in sorted_df.head(max_rows).iterrows():
+        net_sales = row.get('Net Sales', 0)
+        true_cogs = row.get('True_COGS', 0)
+        gross_profit = row.get('True_Margin', 0)
+        true_pct = row.get('True %', 0)
+        qty = row.get('Quantity Sold', 0)
+        unit_cost = true_cogs / qty if qty > 0 else 0
+        sell_price = net_sales / qty if qty > 0 else 0
+        
+        # Truncate long product names
+        product_name = str(row.get('Product', ''))
+        if len(product_name) > 45:
+            product_name = product_name[:42] + '...'
+        
+        table_data.append([
+            Paragraph(str(row.get('Brand', '')), td_style),
+            Paragraph(product_name, td_style),
+            Paragraph(str(row.get('Product Category', '')), td_style),
+            Paragraph(f"{true_pct:.1f}%", td_right_style),
+            Paragraph(format_currency(gross_profit), td_right_style),
+            Paragraph(format_currency(unit_cost), td_right_style),
+            Paragraph(format_currency(sell_price), td_right_style),
+            Paragraph(f"{qty:,.0f}", td_right_style),
+        ])
+    
+    # Column widths
+    col_widths = [0.8*inch, 3.2*inch, 0.8*inch, 0.65*inch, 0.9*inch, 0.75*inch, 0.75*inch, 0.6*inch]
+    
+    product_table = Table(table_data, colWidths=col_widths, repeatRows=1)
+    product_table.setStyle(TableStyle([
+        # Header row
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2E7D32')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
+        ('TOPPADDING', (0, 0), (-1, 0), 6),
+        # Data rows
+        ('FONTSIZE', (0, 1), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 3),
+        ('TOPPADDING', (0, 1), (-1, -1), 3),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#FAFAFA')]),
+        ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E0E0E0')),
+        ('ALIGN', (3, 0), (-1, -1), 'RIGHT'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ]))
+    elements.append(product_table)
+    
+    # Footer note if truncated
+    if len(sorted_df) > max_rows:
+        elements.append(Spacer(1, 4))
+        footer_style = ParagraphStyle('Footer', parent=styles['Normal'], fontSize=7, 
+                                        textColor=colors.gray, alignment=TA_CENTER)
+        elements.append(Paragraph(
+            f"Showing top {max_rows} of {len(sorted_df)} products by True Margin %",
+            footer_style))
+    
+    # Build PDF
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 # ============================================================================
 # EXTRACTION FUNCTIONS - FROM PRICE CHECKER v4.3.3
@@ -1195,6 +1500,88 @@ def add_profile_template_matching(sales_df, catalog_df, progress_callback=None):
     return sales_df
 
 # ============================================================================
+# COGS ADJUSTMENT FUNCTIONS
+# ============================================================================
+
+def apply_cogs_adjustments(df, adjustments=COGS_ADJUSTMENTS):
+    """
+    Apply off-system COGS adjustments (credit memos) as % reduction on Standard COGS.
+    
+    These are rebates received outside the promo credit system. They reduce True COGS
+    (and therefore improve True Margin) without changing Standard COGS.
+    
+    The adjustment amount = Standard_COGS × adjustment_pct for each matching row.
+    
+    Args:
+        df: DataFrame with 'Brand', 'Product Category', and 'Standard_COGS' columns
+        adjustments: COGS_ADJUSTMENTS config dict
+        
+    Returns:
+        DataFrame with 'COGS_Adjustment' column added
+    """
+    df = df.copy()
+    df['COGS_Adjustment'] = 0.0
+    
+    if not adjustments:
+        return df
+    
+    cat_col = 'Product Category' if 'Product Category' in df.columns else 'Category'
+    
+    total_adjusted = 0
+    adjustment_details = []
+    
+    for brand, rules in adjustments.items():
+        brand_mask = df['Brand'] == brand
+        brand_count = brand_mask.sum()
+        
+        if brand_count == 0:
+            continue
+        
+        default_pct = rules.get('default', 0)
+        category_pcts = rules.get('categories', {})
+        
+        # Apply category-specific rates first
+        for category, pct in category_pcts.items():
+            cat_mask = brand_mask & (df[cat_col] == category)
+            cat_count = cat_mask.sum()
+            if cat_count > 0:
+                adj_amount = df.loc[cat_mask, 'Standard_COGS'] * pct
+                df.loc[cat_mask, 'COGS_Adjustment'] = adj_amount
+                total_adj = adj_amount.sum()
+                total_adjusted += cat_count
+                adjustment_details.append(
+                    f"  • {brand} / {category}: {cat_count:,} products × {pct:.0%} = {format_currency(total_adj)}"
+                )
+        
+        # Apply default rate to remaining brand products (those not already adjusted)
+        if default_pct > 0:
+            already_adjusted = df['COGS_Adjustment'] > 0
+            remaining_mask = brand_mask & ~already_adjusted
+            remaining_count = remaining_mask.sum()
+            if remaining_count > 0:
+                adj_amount = df.loc[remaining_mask, 'Standard_COGS'] * default_pct
+                df.loc[remaining_mask, 'COGS_Adjustment'] = adj_amount
+                total_adj = adj_amount.sum()
+                total_adjusted += remaining_count
+                
+                # List the categories that got the default rate
+                default_cats = df.loc[remaining_mask, cat_col].unique()
+                cat_list = ', '.join(sorted(default_cats))
+                adjustment_details.append(
+                    f"  • {brand} / Other ({cat_list}): {remaining_count:,} products × {default_pct:.0%} = {format_currency(total_adj)}"
+                )
+    
+    # Report results
+    grand_total = df['COGS_Adjustment'].sum()
+    if total_adjusted > 0:
+        st.info(f"📋 COGS Adjustments applied to {total_adjusted:,} products — Total: {format_currency(grand_total)}")
+        with st.expander("📋 COGS Adjustment Breakdown"):
+            for detail in adjustment_details:
+                st.write(detail)
+    
+    return df
+
+# ============================================================================
 # MARGIN CALCULATION FUNCTIONS
 # ============================================================================
 
@@ -1205,9 +1592,9 @@ def calculate_margins(df, private_labels):
     Formulas:
     - Standard COGS = Unit Cost * Quantity Sold
     - Standard Margin = Net Sales - Standard COGS
-    - True COGS = Standard COGS - Vendor Pays + Haven Pays
+    - True COGS = Standard COGS - Vendor Pays - COGS Adjustment + Haven Pays
     - True Margin = Net Sales - True COGS
-    - Margin Lift = Vendor Pays - Haven Pays
+    - Margin Lift = Vendor Pays + COGS Adjustment - Haven Pays
     """
     df = df.copy()
     
@@ -1220,12 +1607,15 @@ def calculate_margins(df, private_labels):
     df['Standard_COGS'] = df['Unit Cost'] * df['Quantity Sold']
     df['Standard_Margin'] = df['Net Sales'] - df['Standard_COGS']
     
-    # Calculate True COGS and Margin
-    df['True_COGS'] = df['Standard_COGS'] - df['Vendor_Pays'] + df['Haven_Pays']
+    # Apply COGS adjustments (off-system credit memos)
+    df = apply_cogs_adjustments(df)
+    
+    # Calculate True COGS and Margin (COGS_Adjustment reduces True COGS like Vendor_Pays)
+    df['True_COGS'] = df['Standard_COGS'] - df['Vendor_Pays'] - df['COGS_Adjustment'] + df['Haven_Pays']
     df['True_Margin'] = df['Net Sales'] - df['True_COGS']
     
-    # Margin Lift
-    df['Margin_Lift'] = df['Vendor_Pays'] - df['Haven_Pays']
+    # Margin Lift = total benefit from all credits and adjustments
+    df['Margin_Lift'] = df['Vendor_Pays'] + df['COGS_Adjustment'] - df['Haven_Pays']
     
     # Private Label flag
     df['Is_Private_Label'] = df['Brand'].isin(private_labels)
@@ -1320,6 +1710,7 @@ def render_network_view(df):
     true_margin = df['True_Margin'].sum()
     vendor_pays = df['Vendor_Pays'].sum()
     haven_pays = df['Haven_Pays'].sum()
+    cogs_adj = df['COGS_Adjustment'].sum() if 'COGS_Adjustment' in df.columns else 0
     margin_lift = df['Margin_Lift'].sum()
     
     std_margin_pct = (std_margin / total_sales * 100) if total_sales > 0 else 0
@@ -1338,12 +1729,14 @@ def render_network_view(df):
     
     st.markdown("---")
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("💚 Vendor Pays", format_currency(vendor_pays), help="Credits received from vendors")
+        st.metric("💚 Vendor Pays", format_currency(vendor_pays), help="Credits received from vendors (promo system)")
     with col2:
-        st.metric("🔴 Haven Pays", format_currency(haven_pays), help="Discount cost absorbed by Haven")
+        st.metric("📋 COGS Adjustments", format_currency(cogs_adj), help="Off-system credit memos (e.g. Stiiizy rebate)")
     with col3:
+        st.metric("🔴 Haven Pays", format_currency(haven_pays), help="Discount cost absorbed by Haven")
+    with col4:
         transactions = df['Trans No'].nunique() if 'Trans No' in df.columns else 0
         st.metric("📊 Transactions", f"{transactions:,}")
 
@@ -1351,7 +1744,7 @@ def render_shop_view(df):
     """Shop-level breakdown"""
     st.subheader("🏪 Shop Performance")
     
-    shop_summary = df.groupby('Shop').agg({
+    agg_dict = {
         'Net Sales': 'sum',
         'Standard_Margin': 'sum',
         'True_Margin': 'sum',
@@ -1359,10 +1752,23 @@ def render_shop_view(df):
         'Haven_Pays': 'sum',
         'Margin_Lift': 'sum',
         'Trans No': 'nunique'
-    }).reset_index()
+    }
+    if 'COGS_Adjustment' in df.columns:
+        agg_dict['COGS_Adjustment'] = 'sum'
     
-    shop_summary.columns = ['Shop', 'Net Sales', 'Std Margin', 'True Margin', 
-                            'Vendor Pays', 'Haven Pays', 'Margin Lift', 'Transactions']
+    shop_summary = df.groupby('Shop').agg(agg_dict).reset_index()
+    
+    col_names = ['Shop', 'Net Sales', 'Std Margin', 'True Margin', 
+                 'Vendor Pays', 'Haven Pays', 'Margin Lift', 'Transactions']
+    if 'COGS_Adjustment' in shop_summary.columns:
+        col_names = ['Shop', 'Net Sales', 'Std Margin', 'True Margin', 
+                     'Vendor Pays', 'COGS Adj', 'Haven Pays', 'Margin Lift', 'Transactions']
+        shop_summary = shop_summary[['Shop', 'Net Sales', 'Standard_Margin', 'True_Margin',
+                                      'Vendor_Pays', 'COGS_Adjustment', 'Haven_Pays', 'Margin_Lift', 'Trans No']]
+    else:
+        shop_summary = shop_summary[['Shop', 'Net Sales', 'Standard_Margin', 'True_Margin',
+                                      'Vendor_Pays', 'Haven_Pays', 'Margin_Lift', 'Trans No']]
+    shop_summary.columns = col_names
     
     shop_summary['Std %'] = (shop_summary['Std Margin'] / shop_summary['Net Sales'] * 100).round(1)
     shop_summary['True %'] = (shop_summary['True Margin'] / shop_summary['Net Sales'] * 100).round(1)
@@ -1370,8 +1776,12 @@ def render_shop_view(df):
     shop_summary = shop_summary.sort_values('Net Sales', ascending=False)
     
     display_df = shop_summary.copy()
-    for col in ['Net Sales', 'Std Margin', 'True Margin', 'Vendor Pays', 'Haven Pays', 'Margin Lift']:
-        display_df[col] = display_df[col].apply(format_currency)
+    currency_cols = ['Net Sales', 'Std Margin', 'True Margin', 'Vendor Pays', 'Haven Pays', 'Margin Lift']
+    if 'COGS Adj' in display_df.columns:
+        currency_cols.append('COGS Adj')
+    for col in currency_cols:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].apply(format_currency)
     
     st.dataframe(display_df, use_container_width=True, hide_index=True)
     
@@ -1404,6 +1814,7 @@ def render_brand_view(df):
         'True_Margin': 'sum',
         'Vendor_Pays': 'sum',
         'Haven_Pays': 'sum',
+        'COGS_Adjustment': 'sum',
         'Margin_Lift': 'sum',
         'Quantity Sold': 'sum'
     }).reset_index()
@@ -1417,10 +1828,10 @@ def render_brand_view(df):
     st.info(f"Showing {len(brand_summary):,} brands")
     
     display_cols = ['PL', 'Brand', 'Net Sales', 'Quantity Sold', 'Std %', 'True %', 
-                    'Vendor_Pays', 'Haven_Pays', 'Margin_Lift']
+                    'Vendor_Pays', 'COGS_Adjustment', 'Haven_Pays', 'Margin_Lift']
     
     display_df = brand_summary[display_cols].head(100).copy()
-    for col in ['Net Sales', 'Vendor_Pays', 'Haven_Pays', 'Margin_Lift']:
+    for col in ['Net Sales', 'Vendor_Pays', 'COGS_Adjustment', 'Haven_Pays', 'Margin_Lift']:
         display_df[col] = display_df[col].apply(format_currency)
     
     st.dataframe(display_df, use_container_width=True, hide_index=True)
@@ -1445,6 +1856,7 @@ def render_category_view(df):
         'True_Margin': 'sum',
         'Vendor_Pays': 'sum',
         'Haven_Pays': 'sum',
+        'COGS_Adjustment': 'sum',
         'Margin_Lift': 'sum',
         'Quantity Sold': 'sum'
     }).reset_index()
@@ -1455,7 +1867,7 @@ def render_category_view(df):
     cat_summary = cat_summary.sort_values('Net Sales', ascending=False)
     
     display_df = cat_summary.copy()
-    for col in ['Net Sales', 'Standard_Margin', 'True_Margin', 'Vendor_Pays', 'Haven_Pays', 'Margin_Lift']:
+    for col in ['Net Sales', 'Standard_Margin', 'True_Margin', 'Vendor_Pays', 'COGS_Adjustment', 'Haven_Pays', 'Margin_Lift']:
         display_df[col] = display_df[col].apply(format_currency)
     
     st.dataframe(display_df, use_container_width=True, hide_index=True)
@@ -1503,6 +1915,7 @@ def render_sku_type_view(df):
         'True_Margin': 'sum',
         'Vendor_Pays': 'sum',
         'Haven_Pays': 'sum',
+        'COGS_Adjustment': 'sum',
         'Margin_Lift': 'sum',
         'Quantity Sold': 'sum',
         'Brand': 'first'
@@ -1516,10 +1929,10 @@ def render_sku_type_view(df):
     st.info(f"Showing {len(sku_summary):,} SKU Types")
     
     display_cols = ['Profile_Template', 'Brand', 'Net Sales', 'Quantity Sold', 'Std %', 'True %',
-                    'Vendor_Pays', 'Haven_Pays', 'Margin_Lift']
+                    'Vendor_Pays', 'COGS_Adjustment', 'Haven_Pays', 'Margin_Lift']
     
     display_df = sku_summary[display_cols].head(100).copy()
-    for col in ['Net Sales', 'Vendor_Pays', 'Haven_Pays', 'Margin_Lift']:
+    for col in ['Net Sales', 'Vendor_Pays', 'COGS_Adjustment', 'Haven_Pays', 'Margin_Lift']:
         display_df[col] = display_df[col].apply(format_currency)
     
     st.dataframe(display_df, use_container_width=True, hide_index=True)
@@ -1547,10 +1960,13 @@ def render_product_view(df):
     
     agg_dict = {
         'Net Sales': 'sum',
+        'Standard_COGS': 'sum',
+        'True_COGS': 'sum',
         'Standard_Margin': 'sum',
         'True_Margin': 'sum',
         'Vendor_Pays': 'sum',
         'Haven_Pays': 'sum',
+        'COGS_Adjustment': 'sum',
         'Margin_Lift': 'sum',
         'Quantity Sold': 'sum',
         'Profile_Template': 'first'
@@ -1702,15 +2118,20 @@ def render_product_view(df):
     # ---- Selection Summary Banner ----
     # Calculate combined metrics from filtered set (proper margin math)
     total_sales = filtered['Net Sales'].sum()
+    total_std_cogs = filtered['Standard_COGS'].sum() if 'Standard_COGS' in filtered.columns else 0
+    total_true_cogs = filtered['True_COGS'].sum() if 'True_COGS' in filtered.columns else 0
     total_std_margin = filtered['Standard_Margin'].sum()
     total_true_margin = filtered['True_Margin'].sum()
     total_vendor = filtered['Vendor_Pays'].sum()
-    total_haven = filtered['Haven_Pays'].sum()
+    total_cogs_adj = filtered['COGS_Adjustment'].sum() if 'COGS_Adjustment' in filtered.columns else 0
     total_lift = filtered['Margin_Lift'].sum()
     total_qty = filtered['Quantity Sold'].sum()
+    catalog_unit_cost = (total_std_cogs / total_qty) if total_qty > 0 else 0
+    true_unit_cost = (total_true_cogs / total_qty) if total_qty > 0 else 0
     
     combined_std_pct = (total_std_margin / total_sales * 100) if total_sales > 0 else 0
     combined_true_pct = (total_true_margin / total_sales * 100) if total_sales > 0 else 0
+    avg_selling_price = (total_sales / total_qty) if total_qty > 0 else 0
     
     matched_count = filtered['Profile_Template'].notna().sum()
     unmatched_count = filtered['Profile_Template'].isna().sum()
@@ -1719,22 +2140,32 @@ def render_product_view(df):
     if active_filters:
         st.caption(f"Active filters: {' · '.join(active_filters)}")
     
-    # Summary metrics
-    s_col1, s_col2, s_col3, s_col4, s_col5, s_col6, s_col7 = st.columns(7)
-    with s_col1:
+    # ---- Hero Row: True Margin & Gross Profit (prominent) ----
+    hero1, hero2, hero3 = st.columns([2, 2, 1])
+    with hero1:
+        margin_delta = combined_true_pct - combined_std_pct
+        st.metric("True Margin", f"{combined_true_pct:.1f}%", 
+                  delta=f"+{margin_delta:.1f}% vs std" if margin_delta > 0.1 else None,
+                  help=f"Standard Margin: {combined_std_pct:.1f}%")
+    with hero2:
+        st.metric("Gross Profit", format_currency(total_true_margin), help="Net Sales − True COGS")
+    with hero3:
         st.metric("Products", f"{len(filtered):,}")
-    with s_col2:
+    
+    # ---- Detail Row: Unit Economics & Volume ----
+    d1, d2, d3, d4, d5, d6 = st.columns(6)
+    with d1:
+        st.metric("True Unit Cost", format_currency(true_unit_cost), help="True COGS ÷ Qty Sold")
+    with d2:
+        st.metric("Avg Sell Price", format_currency(avg_selling_price), help="Net Sales ÷ Qty Sold")
+    with d3:
+        st.metric("True COGS", format_currency(total_true_cogs), help="After vendor credits & COGS adjustments")
+    with d4:
         st.metric("Net Sales", format_currency(total_sales))
-    with s_col3:
-        st.metric("Std Margin", f"{combined_std_pct:.1f}%", help=format_currency(total_std_margin))
-    with s_col4:
-        st.metric("True Margin", f"{combined_true_pct:.1f}%", help=format_currency(total_true_margin))
-    with s_col5:
-        st.metric("Vendor Pays", format_currency(total_vendor))
-    with s_col6:
-        st.metric("Margin Lift", format_currency(total_lift))
-    with s_col7:
+    with d5:
         st.metric("Qty Sold", f"{total_qty:,.0f}")
+    with d6:
+        st.metric("Margin Lift", format_currency(total_lift), help=f"Vendor: {format_currency(total_vendor)} · COGS Adj: {format_currency(total_cogs_adj)}")
     
     # ---- Display Controls ----
     d_col1, d_col2 = st.columns([1, 5])
@@ -1757,12 +2188,12 @@ def render_product_view(df):
         if has_category:
             display_cols.append('Product Category')
         display_cols += ['Net Sales', 'Quantity Sold', 'Std %', 'True %',
-                         'Vendor_Pays', 'Haven_Pays', 'Margin_Lift', 'Profile_Template']
+                         'Vendor_Pays', 'COGS_Adjustment', 'Haven_Pays', 'Margin_Lift', 'Profile_Template']
         
         existing_cols = [c for c in display_cols if c in filtered.columns]
         display_df = filtered[existing_cols].head(display_count).copy()
         
-        for col in ['Net Sales', 'Vendor_Pays', 'Haven_Pays', 'Margin_Lift']:
+        for col in ['Net Sales', 'Vendor_Pays', 'COGS_Adjustment', 'Haven_Pays', 'Margin_Lift']:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(format_currency)
         
@@ -1770,15 +2201,15 @@ def render_product_view(df):
     else:
         st.warning("No products match the current filters.")
     
-    # ---- Downloads ----
-    dl_col1, dl_col2 = st.columns(2)
+    # ---- Downloads & Report ----
+    dl_col1, dl_col2, dl_col3 = st.columns(3)
     
     with dl_col1:
         # Download filtered data
         if len(filtered) > 0:
             filt_csv = io.StringIO()
             filtered.drop(columns=['_Weight', '_Pack'], errors='ignore').to_csv(filt_csv, index=False)
-            label = f"📥 Download Filtered ({len(filtered):,} products)" if active_filters else "📥 Download All Product Data"
+            label = f"📥 CSV ({len(filtered):,})" if active_filters else "📥 Download CSV"
             st.download_button(label, filt_csv.getvalue(),
                                "product_true_margins_filtered.csv", "text/csv",
                                key="pv_download_filtered")
@@ -1788,9 +2219,54 @@ def render_product_view(df):
         if active_filters and len(product_summary) > 0:
             full_csv = io.StringIO()
             product_summary.drop(columns=['_Weight', '_Pack'], errors='ignore').to_csv(full_csv, index=False)
-            st.download_button(f"📥 Download All ({len(product_summary):,} products)", full_csv.getvalue(),
+            st.download_button(f"📥 All ({len(product_summary):,})", full_csv.getvalue(),
                                "product_true_margins_all.csv", "text/csv",
                                key="pv_download_all")
+    
+    with dl_col3:
+        # Generate printable report
+        if len(filtered) > 0:
+            # Build summary metrics dict
+            summary_metrics = {
+                'products': len(filtered),
+                'net_sales': total_sales,
+                'true_cogs': total_true_cogs,
+                'gross_profit': total_true_margin,
+                'true_margin_pct': combined_true_pct,
+                'std_margin_pct': combined_std_pct,
+                'catalog_unit_cost': catalog_unit_cost,
+                'true_unit_cost': true_unit_cost,
+                'avg_selling_price': avg_selling_price,
+                'qty_sold': total_qty,
+                'vendor_pays': total_vendor,
+                'cogs_adj': total_cogs_adj,
+                'margin_lift': total_lift
+            }
+            
+            # Build filter info dict with actual filter values for smart description
+            filter_info = {
+                'brands': brand_filter if brand_filter else None,
+                'categories': category_filter if category_filter else None,
+                'templates': template_filter if template_filter else None,
+                'search': text_search if text_search else None,
+            }
+            
+            # Generate PDF report
+            report_pdf = generate_product_report_pdf(
+                filtered_df=filtered,
+                summary_metrics=summary_metrics,
+                filter_info=filter_info,
+                title="Product Margin Report"
+            )
+            
+            st.download_button(
+                "📄 PDF Report",
+                report_pdf,
+                "product_margin_report.pdf",
+                "application/pdf",
+                key="pv_print_report",
+                help="Download PDF report - auto-fits to one page"
+            )
 
 def render_debug_view(df):
     """Debug/Diagnostics tab for analyzing matching quality and data issues"""
@@ -1984,10 +2460,52 @@ def main():
         help="CSV with 'Name' column listing private label brands"
     )
     
+    # COGS Adjustments info
+    if COGS_ADJUSTMENTS:
+        with st.sidebar.expander("📋 COGS Adjustments (Active)"):
+            for brand, rules in COGS_ADJUSTMENTS.items():
+                st.write(f"**{brand}**")
+                default_pct = rules.get('default', 0)
+                cat_pcts = rules.get('categories', {})
+                for cat, pct in cat_pcts.items():
+                    st.write(f"  • {cat}: {pct:.0%}")
+                if default_pct > 0:
+                    st.write(f"  • All other: {default_pct:.0%}")
+            st.caption("Edit COGS_ADJUSTMENTS in app config to modify")
+    
     # Changelog
     with st.sidebar.expander("📋 Version History"):
         st.markdown(f"""
-        **v1.3.2** (Current - 2026-02-04)
+        **v1.4.5** (Current - 2026-02-25)
+        - 📄 Direct PDF report (auto-fits to page)
+        - Smart filter description (brand/category names)
+        - Products count in header (top right)
+        
+        **v1.4.4** (2026-02-25)
+        - 📊 Summary redesign: True Margin & Gross Profit prominent
+        - 💰 NEW: Average Selling Price metric
+        
+        **v1.4.3** (2026-02-25)
+        - 🖨️ NEW: Print Report button in Products tab
+        
+        **v1.4.2** (2026-02-04)
+        - 📊 Product Detail summary reorganized
+        - Row 1: Sales, Profit, Margin, Credits, Lift
+        - Row 2: Qty, Catalog Unit Cost, True Unit Cost
+        - True Unit Cost shows savings delta
+        
+        **v1.4.1** (2026-02-04)
+        - 📊 Product Detail: True COGS, Gross Profit, Avg Unit Cost
+        - Summary split into 2 rows for readability
+        
+        **v1.4.0** (2026-02-04)
+        - 📋 NEW: COGS Adjustments — off-system credit memos
+        - Configurable brand+category % COGS rebates
+        - Stiiizy: 30% Vape/Accessories, 20% all others
+        - Shows as separate column in all aggregation views
+        - Flows into True COGS and Margin Lift calculations
+        
+        **v1.3.2** (2026-02-04)
         - 🔍 Product Detail: rich filtering (search, brand, category, template, weight, pack)
         - 📊 Selection Summary: combined True Margin % from filtered set
         - 🔤 Broad apostrophe fix: catches all orphaned " s " patterns (40's, Mother's, etc.)
@@ -2180,9 +2698,10 @@ def main():
     
     vendor_captured = filtered_df['Vendor_Pays'].sum()
     haven_captured = filtered_df['Haven_Pays'].sum()
+    cogs_adj_captured = filtered_df['COGS_Adjustment'].sum() if 'COGS_Adjustment' in filtered_df.columns else 0
     profile_matched = filtered_df['Profile_Template'].notna().sum() if 'Profile_Template' in filtered_df.columns else 0
     
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         st.metric("Products", f"{len(filtered_df):,}")
     with col2:
@@ -2191,6 +2710,8 @@ def main():
     with col3:
         st.metric("Vendor Credits", format_currency(vendor_captured))
     with col4:
+        st.metric("COGS Adjustments", format_currency(cogs_adj_captured), help="Off-system credit memos")
+    with col5:
         match_pct = (profile_matched / len(filtered_df) * 100) if len(filtered_df) > 0 else 0
         st.metric("SKU Type Match", f"{match_pct:.0f}%")
     
